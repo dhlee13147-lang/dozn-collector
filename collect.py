@@ -87,45 +87,70 @@ def fetch_price(ticker: str, trade_day: date) -> dict:
 
 
 def fetch_fundamentals(ticker: str, trade_day: date) -> dict:
-    """PER·PBR·시가총액 수집"""
+    """PER·PBR·시가총액 수집
+    
+    pykrx 실제 컬럼명:
+      get_market_cap(날짜, 날짜, 티커) 반환:
+        날짜, 시가총액, 거래량, 거래대금, 상장주식수
+      get_market_fundamental(날짜, 날짜, 티커) 반환:
+        날짜, BPS, PER, PBR, EPS, DIV, DPS
+    """
     ds = strdate(trade_day)
     result = {}
     try:
+        # 시가총액: get_market_cap은 (fromdate, todate, ticker) 순서
         df_cap = krx.get_market_cap(ds, ds, ticker)
         if not df_cap.empty:
             row = df_cap.iloc[-1]
             result["시가총액"] = int(row.get("시가총액", 0))
+            result["상장주식수"] = int(row.get("상장주식수", 0))
+    except Exception as e:
+        result["_cap_error"] = str(e)
 
+    try:
+        # PER/PBR: get_market_fundamental은 (fromdate, todate, ticker) 순서
         df_fund = krx.get_market_fundamental(ds, ds, ticker)
         if not df_fund.empty:
             row = df_fund.iloc[-1]
-            result["PER"] = float(row.get("PER", 0))
-            result["PBR"] = float(row.get("PBR", 0))
+            per = float(row.get("PER", 0))
+            pbr = float(row.get("PBR", 0))
+            result["PER"] = per if per > 0 else "-"
+            result["PBR"] = pbr if pbr > 0 else "-"
     except Exception as e:
         result["_fund_error"] = str(e)
+
     return result
 
 
 def fetch_trading_volume(ticker: str, trade_day: date) -> dict:
-    """투자자별 수급(개인·외국인·기관) 수집"""
+    """투자자별 수급(개인·외국인·기관) 수집
+    
+    pykrx 실제 컬럼명:
+      get_market_trading_volume_by_date 반환:
+        날짜, 기관합계, 기타법인, 개인, 외국인합계, 전체
+    """
     ds = strdate(trade_day)
     result = {}
     try:
         df = krx.get_market_trading_volume_by_date(ds, ds, ticker)
         if not df.empty:
             row = df.iloc[-1]
+            # 실제 컬럼명: 개인, 외국인합계, 기관합계
             result["개인"]   = int(row.get("개인", 0))
-            result["외국인"] = int(row.get("외국인", 0))
-            result["기관"]   = int(row.get("기관합계", row.get("기관", 0)))
+            result["외국인"] = int(row.get("외국인합계", row.get("외국인", 0)))
+            result["기관"]   = int(row.get("기관합계", 0))
     except Exception as e:
         result["_supply_error"] = str(e)
     return result
 
 
-def fetch_history(ticker: str, days: int = 20) -> list:
-    """최근 N거래일 종가 이력 수집 (이동평균 계산용)"""
+def fetch_history(ticker: str, days: int = 60) -> list:
+    """최근 N거래일 OHLCV 이력 수집
+    - 기술적 지표 계산에 충분한 데이터 확보를 위해 기본 60일
+    - MACD(26일 EMA), 볼린저밴드(20일), RSI(14일), OBV 모두 커버
+    """
     today = date.today()
-    # 넉넉하게 30일 전부터
+    # 넉넉하게 days*2 전부터 (공휴일·주말 고려)
     start = today - timedelta(days=days * 2)
     try:
         df = krx.get_market_ohlcv(strdate(start), strdate(today), ticker)
@@ -134,22 +159,179 @@ def fetch_history(ticker: str, days: int = 20) -> list:
         records = []
         for dt, row in df.iterrows():
             records.append({
-                "날짜": dt.strftime("%Y-%m-%d"),
-                "종가": int(row.get("종가", 0)),
+                "날짜":   dt.strftime("%Y-%m-%d"),
+                "시가":   int(row.get("시가", 0)),
+                "고가":   int(row.get("고가", 0)),
+                "저가":   int(row.get("저가", 0)),
+                "종가":   int(row.get("종가", 0)),
                 "거래량": int(row.get("거래량", 0)),
             })
-        return records[-days:]   # 최근 N일만
+        return records[-days:]
     except Exception:
         return []
 
 
-def calc_moving_averages(history: list) -> dict:
-    """5일·10일·20일 이동평균 계산"""
-    result = {}
-    closes = [r["종가"] for r in history if r["종가"] > 0]
-    for n in [5, 10, 20]:
+def calc_ema(values: list, period: int) -> list:
+    """지수이동평균(EMA) 계산"""
+    if len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    ema = [sum(values[:period]) / period]   # 초기값: SMA
+    for v in values[period:]:
+        ema.append(v * k + ema[-1] * (1 - k))
+    # 앞부분 padding (None)
+    return [None] * (period - 1) + ema
+
+
+def calc_technical_indicators(history: list) -> dict:
+    """RSI·볼린저밴드·OBV·MACD 계산
+    
+    모두 표준 공식 기반, 외부 라이브러리 없이 순수 파이썬으로 계산
+    """
+    if not history:
+        return {}
+
+    closes  = [r["종가"]   for r in history]
+    volumes = [r["거래량"] for r in history]
+    highs   = [r["고가"]   for r in history]
+    lows    = [r["저가"]   for r in history]
+    result  = {}
+
+    # ── 이동평균 (MA5 / MA10 / MA20 / MA60) ──────────────────────
+    for n in [5, 10, 20, 60]:
         if len(closes) >= n:
             result[f"MA{n}"] = round(sum(closes[-n:]) / n)
+
+    # ── RSI(14) ───────────────────────────────────────────────────
+    # 공식: RS = 평균상승폭 / 평균하락폭, RSI = 100 - 100/(1+RS)
+    if len(closes) >= 15:
+        deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+        gains  = [max(d, 0) for d in deltas]
+        losses = [abs(min(d, 0)) for d in deltas]
+
+        # 최초 14일 단순평균
+        avg_gain = sum(gains[-14:]) / 14
+        avg_loss = sum(losses[-14:]) / 14
+
+        if avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs  = avg_gain / avg_loss
+            rsi = round(100 - (100 / (1 + rs)), 2)
+
+        result["RSI14"] = rsi
+        # 해석
+        if rsi >= 70:
+            result["RSI14_signal"] = "과매수 ⚠️"
+        elif rsi <= 30:
+            result["RSI14_signal"] = "과매도 📉 (반등 가능)"
+        else:
+            result["RSI14_signal"] = "중립"
+
+    # ── 볼린저 밴드 (20일, 2σ) ────────────────────────────────────
+    # 공식: 중심선(MA20), 상단(MA20+2σ), 하단(MA20-2σ)
+    bb_period = 20
+    if len(closes) >= bb_period:
+        window = closes[-bb_period:]
+        ma20   = sum(window) / bb_period
+        std    = (sum((c - ma20) ** 2 for c in window) / bb_period) ** 0.5
+
+        bb_upper = round(ma20 + 2 * std)
+        bb_lower = round(ma20 - 2 * std)
+        bb_mid   = round(ma20)
+        current  = closes[-1]
+        bb_width = round((bb_upper - bb_lower) / bb_mid * 100, 2)  # 밴드폭(%)
+
+        result["BB_upper"]  = bb_upper
+        result["BB_mid"]    = bb_mid
+        result["BB_lower"]  = bb_lower
+        result["BB_width"]  = bb_width
+
+        # 위치 해석
+        if current >= bb_upper:
+            result["BB_signal"] = f"상단 돌파 ⚠️ ({current:,} ≥ {bb_upper:,})"
+        elif current <= bb_lower:
+            result["BB_signal"] = f"하단 이탈 📉 ({current:,} ≤ {bb_lower:,})"
+        elif current > bb_mid:
+            pct = round((current - bb_mid) / (bb_upper - bb_mid) * 100)
+            result["BB_signal"] = f"중심선 위 (상단까지 {100-pct}% 여유)"
+        else:
+            pct = round((bb_mid - current) / (bb_mid - bb_lower) * 100)
+            result["BB_signal"] = f"중심선 아래 (하단까지 {100-pct}% 여유)"
+
+        if bb_width < 5:
+            result["BB_squeeze"] = "밴드 수축 — 큰 움직임 예고 ⚡"
+
+    # ── OBV (On-Balance Volume) ────────────────────────────────────
+    # 공식: 종가 상승일 → OBV += 거래량, 하락일 → OBV -= 거래량
+    # 절댓값보다 방향(추세)이 중요
+    if len(closes) >= 2:
+        obv = 0
+        obv_series = [0]
+        for i in range(1, len(closes)):
+            if closes[i] > closes[i-1]:
+                obv += volumes[i]
+            elif closes[i] < closes[i-1]:
+                obv -= volumes[i]
+            obv_series.append(obv)
+
+        obv_current = obv_series[-1]
+        obv_5d_ago  = obv_series[-6] if len(obv_series) >= 6 else obv_series[0]
+        obv_trend   = obv_current - obv_5d_ago
+
+        result["OBV"]       = obv_current
+        result["OBV_5d_change"] = obv_trend
+
+        # 주가와 OBV 방향 비교 (다이버전스 감지)
+        price_5d_change = closes[-1] - closes[-6] if len(closes) >= 6 else 0
+        if price_5d_change > 0 and obv_trend > 0:
+            result["OBV_signal"] = "주가↑ OBV↑ — 상승 신뢰도 높음 ✅"
+        elif price_5d_change > 0 and obv_trend < 0:
+            result["OBV_signal"] = "주가↑ OBV↓ — 상승 신뢰도 낮음 ⚠️ (다이버전스)"
+        elif price_5d_change < 0 and obv_trend < 0:
+            result["OBV_signal"] = "주가↓ OBV↓ — 하락 신뢰도 높음 📉"
+        elif price_5d_change < 0 and obv_trend > 0:
+            result["OBV_signal"] = "주가↓ OBV↑ — 하락 신뢰도 낮음 (저점 매집 가능성)"
+        else:
+            result["OBV_signal"] = "보합"
+
+    # ── MACD (12/26/9) ─────────────────────────────────────────────
+    # 공식: MACD = EMA12 - EMA26, 시그널 = MACD의 EMA9
+    if len(closes) >= 35:  # 26 + 9 최소 필요
+        ema12_series = calc_ema(closes, 12)
+        ema26_series = calc_ema(closes, 26)
+
+        # 두 EMA가 모두 유효한 구간만
+        macd_series = []
+        for e12, e26 in zip(ema12_series, ema26_series):
+            if e12 is not None and e26 is not None:
+                macd_series.append(round(e12 - e26, 2))
+
+        if len(macd_series) >= 9:
+            signal_series = calc_ema(macd_series, 9)
+            signal_valid  = [s for s in signal_series if s is not None]
+
+            if signal_valid:
+                macd_val    = macd_series[-1]
+                signal_val  = round(signal_valid[-1], 2)
+                histogram   = round(macd_val - signal_val, 2)
+
+                result["MACD"]      = macd_val
+                result["MACD_signal"] = signal_val
+                result["MACD_hist"]   = histogram
+
+                # 이전 히스토그램과 비교 (골든크로스/데드크로스)
+                if len(macd_series) >= 2 and len(signal_valid) >= 2:
+                    prev_hist = macd_series[-2] - signal_valid[-2]
+                    if prev_hist <= 0 and histogram > 0:
+                        result["MACD_cross"] = "골든크로스 📈 (매수 신호)"
+                    elif prev_hist >= 0 and histogram < 0:
+                        result["MACD_cross"] = "데드크로스 📉 (매도 신호)"
+                    elif histogram > 0:
+                        result["MACD_cross"] = "MACD > 시그널 (강세 유지)"
+                    else:
+                        result["MACD_cross"] = "MACD < 시그널 (약세 유지)"
+
     return result
 
 
@@ -260,10 +442,11 @@ def collect_all() -> dict:
     result["수급"]    = fetch_trading_volume(ticker, trade_day)
     result["기본정보"] = fetch_fundamentals(ticker, trade_day)
 
-    print("  ▶ 이동평균 계산...")
-    history = fetch_history(ticker, days=20)
-    result["이동평균"] = calc_moving_averages(history)
-    result["이동평균"]["history_20d"] = history   # 스킬에서 참조용
+    print("  ▶ 이동평균 및 기술적 지표 계산...")
+    history = fetch_history(ticker, days=60)
+    indicators = calc_technical_indicators(history)
+    result["이동평균"] = indicators
+    result["이동평균"]["history_60d"] = history   # 스킬에서 참조용
 
     # ── 피어 그룹 ────────────────────────
     for name, t in [("헥토파이낸셜", TICKERS["헥토파이낸셜"]),
@@ -312,24 +495,45 @@ def format_telegram(data: dict) -> str:
     chg = p.get("등락률", 0)
     arrow = "📈" if chg > 0 else ("📉" if chg < 0 else "➡️")
 
+    # 거래대금 표시 (원 단위 → 억 단위 변환, 소수점 1자리)
+    trade_amt = p.get('거래대금', 0)
+    if trade_amt >= 100000000:
+        trade_amt_str = f"{trade_amt / 100000000:.1f}억"
+    elif trade_amt > 0:
+        trade_amt_str = f"{trade_amt // 10000}만"
+    else:
+        trade_amt_str = "0억"
+
+    # 시가총액
+    mktcap = info.get('시가총액', 0)
+    mktcap_str = f"{mktcap // 100000000:,}억" if mktcap > 0 else "-"
+
     lines = [
         f"📊 *더즌(462860) 일간 주가 리포트* — {d}",
         "",
         f"*{arrow} 주가 요약*",
         f"  종가: {p.get('종가',0):,}원  ({chg:+.2f}%)",
         f"  시가: {p.get('시가',0):,}  고가: {p.get('고가',0):,}  저가: {p.get('저가',0):,}",
-        f"  거래량: {p.get('거래량',0):,}주  거래대금: {p.get('거래대금',0)//100000000:,}억",
+        f"  거래량: {p.get('거래량',0):,}주  거래대금: {trade_amt_str}",
         "",
         "*📐 이동평균*",
         f"  MA5:  {ma.get('MA5','-'):,}" if ma.get('MA5') else "  MA5: 계산 중",
         f"  MA10: {ma.get('MA10','-'):,}" if ma.get('MA10') else "  MA10: 계산 중",
         f"  MA20: {ma.get('MA20','-'):,}" if ma.get('MA20') else "  MA20: 계산 중",
         "",
+        "*📊 기술적 지표*",
+        f"  RSI(14): {ma.get('RSI14','-')} — {ma.get('RSI14_signal','')}",
+        f"  볼린저: 상단 {ma.get('BB_upper','-'):,} / 중심 {ma.get('BB_mid','-'):,} / 하단 {ma.get('BB_lower','-'):,}" if ma.get('BB_upper') else "  볼린저: 계산 중",
+        f"    → {ma.get('BB_signal','')}",
+        f"    → {ma.get('BB_squeeze','')}" if ma.get('BB_squeeze') else "",
+        f"  OBV: {ma.get('OBV_signal','-')}",
+        f"  MACD: {ma.get('MACD','-')} / 시그널: {ma.get('MACD_signal','-')} — {ma.get('MACD_cross','')}",
+        "",
         "*👥 수급*",
         f"  개인: {s.get('개인',0):+,}  외국인: {s.get('외국인',0):+,}  기관: {s.get('기관',0):+,}",
         "",
         "*🏢 기본정보*",
-        f"  시가총액: {info.get('시가총액',0)//100000000:,}억  PER: {info.get('PER','-')}  PBR: {info.get('PBR','-')}",
+        f"  시가총액: {mktcap_str}  PER: {info.get('PER','-')}  PBR: {info.get('PBR','-')}",
     ]
 
     # 피어
