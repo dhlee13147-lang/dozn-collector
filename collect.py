@@ -1,9 +1,9 @@
 """
-더즌(462860) 기업분석 데이터 수집기 v4.13 (안정성 강화)
+더즌(462860) 기업분석 데이터 수집기 v4.14
 ===================================================
-- 데이터 확인 불가 해결: 통신 에러 시 재시도(Retry) 로직 추가
-- 네트워크 안정성: 요청 간 지연 시간(Sleep) 도입으로 차단 방지
-- 가독성: 텔레그램 메시지 내 핵심 수치 강조
+- 필드명 대응: ACC_TRDVAL(거래대금) 유연 처리
+- 전송 로직 복원: 기존에 성공했던 텔레그램 전송 및 파일 첨부 방식 적용
+- 분석 지표: MA, RSI, 볼린저밴드 내부 연산
 """
 
 import os, json, re, time, urllib.request, urllib.parse
@@ -13,100 +13,95 @@ import pandas as pd
 from pykrx import stock as krx
 from bs4 import BeautifulSoup
 
+# ─────────────────────────────────────────
+# 설정
+# ─────────────────────────────────────────
 TICKERS = {"더즌": "462860", "헥토파이낸셜": "234340", "쿠콘": "294570"}
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+}
 
+# ─────────────────────────────────────────
+# 1. 날짜 및 데이터 수집 (거래대금 필드 보강)
+# ─────────────────────────────────────────
 def find_latest_valid_date(ticker):
-    """유효 데이터를 찾기 위해 최대 10일을 역추적하며 재시도 수행"""
     now_kst = datetime.utcnow() + timedelta(hours=9)
     search_start = now_kst.date() if now_kst.hour >= 16 else now_kst.date() - timedelta(days=1)
-    
     for i in range(10):
         target = search_start - timedelta(days=i)
         ds = target.strftime("%Y%m%d")
-        # 네트워크 불안정을 대비해 날짜별로 최대 2번 재시도
-        for retry in range(2):
-            try:
-                df = krx.get_market_ohlcv(ds, ds, ticker)
-                if not df.empty and df.iloc[0]["종가"] > 0:
-                    print(f"✅ 데이터 확인 성공: {ds}")
-                    return target
-                time.sleep(1) # 요청 간격 조절
-            except:
-                time.sleep(2)
-                continue
+        try:
+            df = krx.get_market_ohlcv(ds, ds, ticker)
+            if not df.empty and int(df.iloc[0].get("종가", 0)) > 0:
+                return target
+        except: continue
     return None
 
 def get_comprehensive_data(ticker, target_date):
     if not target_date: return {}
     ds = target_date.strftime("%Y%m%d")
-    res = {"price": {}, "supply": {}, "tech": {}}
+    res = {"price": {"close": 0, "rate": 0.0, "vol": 0, "amt": 0}, "supply": {"ant": 0, "foreigner": 0, "inst": 0}, "tech": {}}
     try:
         df = krx.get_market_ohlcv(ds, ds, ticker)
         if not df.empty:
             row = df.iloc[0]
-            res["price"] = {"close": int(row["종가"]), "rate": float(row["등락률"]), "vol": int(row["거래량"]), "amt": int(row["거래대금"])}
+            # 거래대금 필드 대응 (ACC_TRDVAL 포함)
+            amt = row.get("거래대금") or row.get("ACC_TRDVAL") or row.get("거래금액") or 0
+            res["price"] = {"close": int(row.get("종가", 0)), "rate": float(row.get("등락률", 0.0)), "vol": int(row.get("거래량", 0)), "amt": int(amt)}
         
         df_inv = krx.get_market_net_purchases_of_equities_by_ticker(ds, ds, ticker)
         if not df_inv.empty:
             inv = df_inv.iloc[0]
-            res["supply"] = {"ant": int(inv["개인"]), "foreigner": int(inv["외국인"]), "inst": int(inv["기관합계"])}
+            res["supply"] = {"ant": int(inv.get("개인", 0)), "foreigner": int(inv.get("외국인", 0)), "inst": int(inv.get("기관합계", 0))}
 
         start_ds = (target_date - timedelta(days=150)).strftime("%Y%m%d")
         df_h = krx.get_market_ohlcv(start_ds, ds, ticker)
         if not df_h.empty:
-            ma5 = df_h['종가'].rolling(5).mean().iloc[-1]
-            ma20 = df_h['종가'].rolling(20).mean().iloc[-1]
-            diff = df_h['종가'].diff()
-            up, down = diff.where(diff > 0, 0), -diff.where(diff < 0, 0)
+            c = df_h['종가']
+            ma5, ma20 = c.rolling(5).mean().iloc[-1], c.rolling(20).mean().iloc[-1]
+            diff = c.diff(); up, down = diff.where(diff > 0, 0), -diff.where(diff < 0, 0)
             rsi = 100 - (100 / (1 + up.ewm(com=13).mean() / down.ewm(com=13).mean())).iloc[-1]
-            std = df_h['종가'].rolling(20).std().iloc[-1]
+            std = c.rolling(20).std().iloc[-1]
             res["tech"] = {"ma5": int(ma5), "ma20": int(ma20), "rsi": round(rsi, 2), "bb_u": int(ma20 + 2*std), "bb_l": int(ma20 - 2*std)}
-    except Exception as e:
-        print(f"⚠️ 지표 계산 중 오류: {e}")
+    except: pass
     return res
 
+# ─────────────────────────────────────────
+# 2. 뉴스 수집
+# ─────────────────────────────────────────
 def fetch_news_list(query):
     news_items = []
     try:
         url = f"https://search.naver.com/search.naver?where=news&query={urllib.parse.quote(query)}&sort=1"
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(resp.text, 'html.parser')
         for item in soup.select('ul.list_news > li.bx')[:3]:
-            t_tag, p_tag = item.select_one('a.news_tit'), item.select_one('a.info.press')
-            if t_tag:
-                news_items.append(f"    - {t_tag.get_text(strip=True)} ({p_tag.get_text(strip=True) if p_tag else '뉴스'})")
-        time.sleep(0.5) # 뉴스 수집 간 딜레이
-    except:
-        pass
+            t, p = item.select_one('a.news_tit'), item.select_one('a.info.press')
+            if t: news_items.append(f"    - {t.get_text(strip=True)} ({p.get_text(strip=True) if p else '뉴스'})")
+    except: pass
     return news_items
 
-def main():
-    target_ticker = TICKERS["더즌"]
-    v_date = find_latest_valid_date(target_ticker)
+# ─────────────────────────────────────────
+# 3. 메시지 포맷팅 및 전송 (기존 성공 로직 반영)
+# ─────────────────────────────────────────
+def format_telegram(data_package):
+    v_date = data_package["date"]
+    m_data = data_package["main"]
+    p_results = data_package["peers"]
+    news_data = data_package["news"]
     
-    if not v_date:
-        print("❌ [오류] 최근 10일간 유효한 데이터를 찾지 못했습니다. 네트워크 상태를 확인하세요.")
-        return
-
-    m_data = get_comprehensive_data(target_ticker, v_date)
-    p_results = {n: get_comprehensive_data(c, v_date) for n, c in TICKERS.items() if n != "더즌"}
-
     p, s, t = m_data["price"], m_data["supply"], m_data["tech"]
-    if not p or p.get("close", 0) == 0:
-        print("❌ [오류] 시세 데이터가 비어 있습니다.")
-        return
-
-    icon = "📈" if p['rate'] > 0 else "📉" if p['rate'] < 0 else "➡️"
+    status = "📈" if p['rate'] > 0 else "📉" if p['rate'] < 0 else "➡️"
+    
     msg = [
-        f"📊 *더즌({target_ticker}) 기업분석 리포트*",
-        f"분석 기준: {v_date.strftime('%Y-%m-%d')}",
+        f"📊 *더즌({TICKERS['더즌']}) 기업분석 리포트* — {v_date.strftime('%Y-%m-%d')}",
         "",
-        f"*{icon} 주가 동향*",
+        f"*{status} 가격 및 거래량*",
         f"  • 종가: {p['close']:,}원 ({p['rate']:+.2f}%)",
         f"  • 거래량: {p['vol']:,}주 / 대금: {p['amt']/100000000:.1f}억",
         "",
-        f"*👥 투자자별 수급 (주)*",
+        f"*👥 투자자별 수급 (단위: 주)*",
         f"  • 개인: {s.get('ant', 0):+,} | 외인: {s.get('foreigner', 0):+,} | 기관: {s.get('inst', 0):+,}",
         "",
         f"*📐 기술적 지표*",
@@ -116,28 +111,79 @@ def main():
         "",
         "*🔗 피어 그룹 비교*"
     ]
-    
     for name, data in p_results.items():
         pp = data.get("price", {})
-        if pp: msg.append(f"  • {name}: {pp.get('close', 0):,}원 ({pp.get('rate', 0.0):+.2f}%)")
+        msg.append(f"  • {name}: {pp.get('close', 0):,}원 ({pp.get('rate', 0.0):+.2f}%)")
 
     msg.append("\n*📰 종목별 최신 뉴스*")
-    for q_name in TICKERS.keys():
-        n_list = fetch_news_list(f"{q_name} 주가")
+    for name, n_list in news_data.items():
         if n_list:
-            msg.append(f"  ▸ {q_name}")
+            msg.append(f"  ▸ {name}")
             msg.extend(n_list)
-
-    full_text = "\n".join(msg)
-    token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+            
+    msg.append("\n─────────────────────")
+    msg.append("📌 _Claude 스킬 사용법_")
+    msg.append("_JSON 파일을 Claude 채팅에 붙여넣고_")
+    msg.append("_\"일간 리포트 노션에 올려줘\" 입력_")
     
-    if token and chat_id:
-        res = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                            json={"chat_id": chat_id, "text": full_text, "parse_mode": "Markdown", "disable_web_page_preview": True})
-        if res.status_code == 200: print("✅ 텔레그램 전송 완료")
-        else: print(f"❌ 전송 실패: {res.text}")
-    else:
-        print(full_text)
+    return "\n".join(msg)
+
+def send_telegram(text: str, json_data: dict):
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    
+    if not token or not chat_id:
+        print("\n" + "="*60 + "\n" + text + "\n[JSON]\n" + json.dumps(json_data, ensure_ascii=False, indent=2))
+        return
+
+    base_url = f"https://api.telegram.org/bot{token}"
+    
+    # 1. 메시지 전송
+    r1 = requests.post(f"{base_url}/sendMessage", json={
+        "chat_id": chat_id, "text": text,
+        "parse_mode": "Markdown", "disable_web_page_preview": True,
+    })
+    if r1.status_code != 200: print(f"메시지 전송 실패: {r1.text}")
+
+    # 2. JSON 파일 전송 (기존 성공 방식: 인메모리 jb 전송)
+    jb = json.dumps(json_data, ensure_ascii=False, indent=2).encode("utf-8")
+    trade_date_str = json_data.get("trade_date", datetime.now().strftime("%Y%m%d"))
+    
+    r2 = requests.post(f"{base_url}/sendDocument", data={
+        "chat_id": chat_id,
+        "caption": f"📎 Claude 스킬 입력용 — {trade_date_str}",
+    }, files={"document": (f"dozen_{trade_date_str}.json", jb, "application/json")})
+    
+    if r2.status_code == 200: print("✅ 텔레그램 전송 완료")
+    else: print(f"파일 전송 실패: {r2.text}")
+
+# ─────────────────────────────────────────
+# 메인 실행
+# ─────────────────────────────────────────
+def main():
+    target_ticker = TICKERS["더즌"]
+    v_date = find_latest_valid_date(target_ticker)
+    
+    if not v_date:
+        print("❌ 유효 데이터를 찾지 못했습니다."); return
+
+    # 데이터 패키징
+    main_data = get_comprehensive_data(target_ticker, v_date)
+    peer_results = {n: get_comprehensive_data(c, v_date) for n, c in TICKERS.items() if n != "더즌"}
+    news_results = {n: fetch_news_list(f"{n} 주가") for n in TICKERS.keys()}
+    
+    package = {"date": v_date, "main": main_data, "peers": peer_results, "news": news_results}
+    
+    # 출력 및 전송
+    report_text = format_telegram(package)
+    json_output = {
+        "trade_date": v_date.strftime("%Y-%m-%d"),
+        "main_stock": main_data,
+        "peer_stocks": peer_results,
+        "news": news_results
+    }
+    
+    send_telegram(report_text, json_output)
 
 if __name__ == "__main__":
     main()
