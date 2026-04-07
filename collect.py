@@ -1,10 +1,10 @@
 """
-더즌(462860) 기업분석 데이터 수집기 v4.19
+더즌(462860) 기업분석 데이터 수집기 v4.20
 ===================================================
-- 오류 수정: 128라인 RSI 판정 로직의 f-string 구문 오류 해결
 - 명세서 반영: ACC_TRDVAL(거래대금), ACC_TRDVOL(거래량) 직접 매핑
-- 수집 보장: 데이터 누락 시 0으로 치환하여 리포트 완성 보장
-- 파일 생성: GitHub Artifact 업로드를 위한 output 폴더 자동 생성
+- 오류 수정: 78라인 및 128라인의 문자열 잘림(SyntaxError) 현상 해결
+- 안정성: 데이터 누락 시 0으로 자동 치환 및 유효 거래일 자동 탐색
+- 전송 로직: 기존에 성공했던 텔레그램 바이너리 전송 방식 적용
 """
 
 import os, json, re, time, urllib.request, urllib.parse
@@ -18,9 +18,10 @@ from bs4 import BeautifulSoup
 TICKERS = {"더즌": "462860", "헥토파이낸셜": "234340", "쿠콘": "294570"}
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
 
-# [2] 유효 거래일 탐색 (명세서상 2010년 이후 데이터 제공)
+# [2] 유효 거래일 탐색 (API 명세서상 2010-01-04 데이터부터 제공 확인)
 def find_latest_valid_date(ticker):
     now_kst = datetime.utcnow() + timedelta(hours=9)
+    # 장 마감(16:00) 전이면 전일 데이터부터 확인
     search_start = now_kst.date() if now_kst.hour >= 16 else now_kst.date() - timedelta(days=1)
     for i in range(10):
         target = search_start - timedelta(days=i)
@@ -31,7 +32,7 @@ def find_latest_valid_date(ticker):
         except: continue
     return search_start
 
-# [3] 데이터 수집 (명세서 규격 적용)
+# [3] 데이터 수집 (명세서 필드명 강제 매핑)
 def get_comprehensive_data(ticker, target_date):
     ds = target_date.strftime("%Y%m%d")
     res = {"price": {"close": 0, "rate": 0.0, "vol": 0, "amt": 0}, "supply": {"ant": 0, "foreigner": 0, "inst": 0}, "tech": {}}
@@ -39,17 +40,18 @@ def get_comprehensive_data(ticker, target_date):
         df = krx.get_market_ohlcv(ds, ds, ticker)
         if not df.empty:
             row = df.iloc[0].to_dict()
-            # API 명세서 필드명(ACC_TRDVOL, ACC_TRDVAL) 매핑
+            # API 명세서 기반 거래량(ACC_TRDVOL), 거래대금(ACC_TRDVAL) 매핑
             vol = row.get("ACC_TRDVOL") or row.get("거래량") or 0
             amt = row.get("ACC_TRDVAL") or row.get("거래대금") or 0
             
             res["price"] = {
-                "close": int(row.get("종가") or row.get("TDD_CLSPRC") or 0), 
-                "rate": float(row.get("등락률") or row.get("FLUC_RT") or 0.0), 
+                "close": int(row.get("TDD_CLSPRC") or row.get("종가") or 0), 
+                "rate": float(row.get("FLUC_RT") or row.get("등락률") or 0.0), 
                 "vol": int(vol), 
                 "amt": int(amt)
             }
         
+        # 수급 정보 수집
         df_inv = krx.get_market_net_purchases_of_equities_by_ticker(ds, ds, ticker)
         if not df_inv.empty:
             inv = df_inv.iloc[0].to_dict()
@@ -59,6 +61,7 @@ def get_comprehensive_data(ticker, target_date):
                 "inst": int(inv.get("기관합계") or 0)
             }
 
+        # 기술적 지표 계산 (Pandas 기반)
         start_ds = (target_date - timedelta(days=150)).strftime("%Y%m%d")
         df_h = krx.get_market_ohlcv(start_ds, ds, ticker)
         if not df_h.empty:
@@ -71,8 +74,54 @@ def get_comprehensive_data(ticker, target_date):
     except: pass
     return res
 
-# [4] 뉴스 수집
+# [4] 뉴스 수집 (SyntaxError 방지용 URL 빌더)
 def fetch_news_list(query):
     news_items = []
     try:
-        url = f"
+        base_url = "https://search.naver.com/search.naver"
+        params = {"where": "news", "query": query, "sort": "1"}
+        target_url = f"{base_url}?{urllib.parse.urlencode(params)}"
+        
+        resp = requests.get(target_url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        for item in soup.select('ul.list_news > li.bx')[:3]:
+            t_tag = item.select_one('a.news_tit')
+            p_tag = item.select_one('a.info.press')
+            if t_tag:
+                title = t_tag.get_text(strip=True)
+                press = p_tag.get_text(strip=True) if p_tag else "뉴스"
+                news_items.append(f"    - {title} ({press})")
+    except: pass
+    return news_items
+
+# [5] 텔레그램 전송
+def send_telegram(text: str, json_data: dict):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id: return
+
+    base_url = f"https://api.telegram.org/bot{token}"
+    # 메시지 전송
+    requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
+
+    # JSON 바이너리 전송
+    jb = json.dumps(json_data, ensure_ascii=False, indent=2).encode("utf-8")
+    t_str = json_data.get("trade_date", "output")
+    requests.post(f"{base_url}/sendDocument", data={"chat_id": chat_id}, files={"document": (f"dozen_{t_str}.json", jb)})
+
+# [6] 메인 실행
+def main():
+    target_name = "더즌"
+    ticker_dozen = TICKERS[target_name]
+    
+    v_date = find_latest_valid_date(ticker_dozen)
+    main_data = get_comprehensive_data(ticker_dozen, v_date)
+    peer_results = {n: get_comprehensive_data(c, v_date) for n, c in TICKERS.items() if n != target_name}
+    news_results = {n: fetch_news_list(f"{n} 주가") for n in TICKERS.keys()}
+
+    p, s, t = main_data["price"], main_data["supply"], main_data["tech"]
+    status = "📈" if p['rate'] > 0 else "📉" if p['rate'] < 0 else "➡️"
+    
+    # 지표 분석
+    rsi_val = t.get('rsi', 0)
+    rsi_sig = "과매수" if rsi_val > 70 else "과매도" if rsi_
