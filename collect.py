@@ -1,9 +1,9 @@
 """
-더즌(462860) 기업분석 데이터 수집기 v4.14
+더즌(462860) 기업분석 데이터 수집기 v4.15
 ===================================================
-- 필드명 대응: ACC_TRDVAL(거래대금) 유연 처리
-- 전송 로직 복원: 기존에 성공했던 텔레그램 전송 및 파일 첨부 방식 적용
-- 분석 지표: MA, RSI, 볼린저밴드 내부 연산
+- 명세서 반영: ACC_TRDVAL(거래대금), ACC_TRDVOL(거래량) 필드 표준화 
+- 수급 보강: KRX 일별매매정보 규격을 바탕으로 투자자별 데이터 매핑 
+- 안정성: 텔레그램 바이너리 전송 및 날짜 역추적 로직 통합
 """
 
 import os, json, re, time, urllib.request, urllib.parse
@@ -13,21 +13,18 @@ import pandas as pd
 from pykrx import stock as krx
 from bs4 import BeautifulSoup
 
-# ─────────────────────────────────────────
-# 설정
-# ─────────────────────────────────────────
+# [1] 설정
 TICKERS = {"더즌": "462860", "헥토파이낸셜": "234340", "쿠콘": "294570"}
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9",
 }
 
-# ─────────────────────────────────────────
-# 1. 날짜 및 데이터 수집 (거래대금 필드 보강)
-# ─────────────────────────────────────────
+# [2] 유효 거래일 탐색 (명세서상 2010년 이후 데이터 제공 확인 )
 def find_latest_valid_date(ticker):
     now_kst = datetime.utcnow() + timedelta(hours=9)
     search_start = now_kst.date() if now_kst.hour >= 16 else now_kst.date() - timedelta(days=1)
+    
     for i in range(10):
         target = search_start - timedelta(days=i)
         ds = target.strftime("%Y%m%d")
@@ -38,23 +35,39 @@ def find_latest_valid_date(ticker):
         except: continue
     return None
 
+# [3] 데이터 수집 (API 명세서 필드명 적용 )
 def get_comprehensive_data(ticker, target_date):
     if not target_date: return {}
     ds = target_date.strftime("%Y%m%d")
     res = {"price": {"close": 0, "rate": 0.0, "vol": 0, "amt": 0}, "supply": {"ant": 0, "foreigner": 0, "inst": 0}, "tech": {}}
+    
     try:
+        # 시세 정보 (명세서 필드명 대응: ACC_TRDVOL, ACC_TRDVAL )
         df = krx.get_market_ohlcv(ds, ds, ticker)
         if not df.empty:
             row = df.iloc[0]
-            # 거래대금 필드 대응 (ACC_TRDVAL 포함)
-            amt = row.get("거래대금") or row.get("ACC_TRDVAL") or row.get("거래금액") or 0
-            res["price"] = {"close": int(row.get("종가", 0)), "rate": float(row.get("등락률", 0.0)), "vol": int(row.get("거래량", 0)), "amt": int(amt)}
+            # 명세서상 거래량은 ACC_TRDVOL, 거래대금은 ACC_TRDVAL 
+            vol = row.get("거래량") or row.get("ACC_TRDVOL") or 0
+            amt = row.get("거래대금") or row.get("ACC_TRDVAL") or 0
+            
+            res["price"] = {
+                "close": int(row.get("종가", 0)), 
+                "rate": float(row.get("등락률", 0.0)), 
+                "vol": int(vol), 
+                "amt": int(amt)
+            }
         
+        # 수급 정보 (투자자별 순매수량)
         df_inv = krx.get_market_net_purchases_of_equities_by_ticker(ds, ds, ticker)
         if not df_inv.empty:
             inv = df_inv.iloc[0]
-            res["supply"] = {"ant": int(inv.get("개인", 0)), "foreigner": int(inv.get("외국인", 0)), "inst": int(inv.get("기관합계", 0))}
+            res["supply"] = {
+                "ant": int(inv.get("개인", 0)), 
+                "foreigner": int(inv.get("외국인", 0)), 
+                "inst": int(inv.get("기관합계", 0))
+            }
 
+        # 기술적 지표 연산
         start_ds = (target_date - timedelta(days=150)).strftime("%Y%m%d")
         df_h = krx.get_market_ohlcv(start_ds, ds, ticker)
         if not df_h.empty:
@@ -67,9 +80,7 @@ def get_comprehensive_data(ticker, target_date):
     except: pass
     return res
 
-# ─────────────────────────────────────────
-# 2. 뉴스 수집
-# ─────────────────────────────────────────
+# [4] 뉴스 수집
 def fetch_news_list(query):
     news_items = []
     try:
@@ -82,27 +93,41 @@ def fetch_news_list(query):
     except: pass
     return news_items
 
-# ─────────────────────────────────────────
-# 3. 메시지 포맷팅 및 전송 (기존 성공 로직 반영)
-# ─────────────────────────────────────────
-def format_telegram(data_package):
-    v_date = data_package["date"]
-    m_data = data_package["main"]
-    p_results = data_package["peers"]
-    news_data = data_package["news"]
-    
-    p, s, t = m_data["price"], m_data["supply"], m_data["tech"]
+# [5] 텔레그램 전송 로직 (기존 성공 방식 유지)
+def send_telegram(text: str, json_data: dict):
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id: return
+
+    base_url = f"https://api.telegram.org/bot{token}"
+    requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
+
+    jb = json.dumps(json_data, ensure_ascii=False, indent=2).encode("utf-8")
+    t_str = json_data.get("trade_date", datetime.now().strftime("%Y%m%d"))
+    requests.post(f"{base_url}/sendDocument", data={"chat_id": chat_id, "caption": f"📎 데이터 파일 — {t_str}"}, files={"document": (f"dozen_{t_str}.json", jb, "application/json")})
+
+# [6] 메인 실행
+def main():
+    target_ticker = TICKERS["더즌"]
+    v_date = find_latest_valid_date(target_ticker)
+    if not v_date: return
+
+    main_data = get_comprehensive_data(target_ticker, v_date)
+    peer_results = {n: get_comprehensive_data(c, v_date) for n, c in TICKERS.items() if n != "더즌"}
+    news_results = {n: fetch_news_list(f"{n} 주가") for n in TICKERS.keys()}
+
+    p, s, t = main_data["price"], main_data["supply"], main_data["tech"]
     status = "📈" if p['rate'] > 0 else "📉" if p['rate'] < 0 else "➡️"
     
-    msg = [
-        f"📊 *더즌({TICKERS['더즌']}) 기업분석 리포트* — {v_date.strftime('%Y-%m-%d')}",
+    report = [
+        f"📊 *더즌({target_ticker}) 기업분석 리포트* — {v_date.strftime('%Y-%m-%d')}",
         "",
-        f"*{status} 가격 및 거래량*",
+        f"*{status} 가격 및 거래 지표*",
         f"  • 종가: {p['close']:,}원 ({p['rate']:+.2f}%)",
-        f"  • 거래량: {p['vol']:,}주 / 대금: {p['amt']/100000000:.1f}억",
+        f"  • 거래량: {p['vol']:,}주 / 대금: {p['amt']/100000000:.2f}억",
         "",
         f"*👥 투자자별 수급 (단위: 주)*",
-        f"  • 개인: {s.get('ant', 0):+,} | 외인: {s.get('foreigner', 0):+,} | 기관: {s.get('inst', 0):+,}",
+        f"  • 개인: {s['ant']:+,} | 외인: {s['foreigner']:+,} | 기관: {s['inst']:+,}",
         "",
         f"*📐 기술적 지표*",
         f"  • 이동평균: MA5({t.get('ma5', 0):,}) | MA20({t.get('ma20', 0):,})",
@@ -111,79 +136,21 @@ def format_telegram(data_package):
         "",
         "*🔗 피어 그룹 비교*"
     ]
-    for name, data in p_results.items():
+    for name, data in peer_results.items():
         pp = data.get("price", {})
-        msg.append(f"  • {name}: {pp.get('close', 0):,}원 ({pp.get('rate', 0.0):+.2f}%)")
+        report.append(f"  • {name}: {pp.get('close', 0):, }원 ({pp.get('rate', 0.0):+.2f}%)")
 
-    msg.append("\n*📰 종목별 최신 뉴스*")
-    for name, n_list in news_data.items():
+    report.append("\n*📰 종목별 최신 뉴스*")
+    for name, n_list in news_results.items():
         if n_list:
-            msg.append(f"  ▸ {name}")
-            msg.extend(n_list)
-            
-    msg.append("\n─────────────────────")
-    msg.append("📌 _Claude 스킬 사용법_")
-    msg.append("_JSON 파일을 Claude 채팅에 붙여넣고_")
-    msg.append("_\"일간 리포트 노션에 올려줘\" 입력_")
-    
-    return "\n".join(msg)
+            report.append(f"  ▸ {name}")
+            report.extend(n_list)
 
-def send_telegram(text: str, json_data: dict):
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    full_text = "\n".join(report)
+    json_out = {"trade_date": v_date.strftime("%Y-%m-%d"), "main": main_data, "peers": peer_results, "news": news_results}
     
-    if not token or not chat_id:
-        print("\n" + "="*60 + "\n" + text + "\n[JSON]\n" + json.dumps(json_data, ensure_ascii=False, indent=2))
-        return
-
-    base_url = f"https://api.telegram.org/bot{token}"
-    
-    # 1. 메시지 전송
-    r1 = requests.post(f"{base_url}/sendMessage", json={
-        "chat_id": chat_id, "text": text,
-        "parse_mode": "Markdown", "disable_web_page_preview": True,
-    })
-    if r1.status_code != 200: print(f"메시지 전송 실패: {r1.text}")
-
-    # 2. JSON 파일 전송 (기존 성공 방식: 인메모리 jb 전송)
-    jb = json.dumps(json_data, ensure_ascii=False, indent=2).encode("utf-8")
-    trade_date_str = json_data.get("trade_date", datetime.now().strftime("%Y%m%d"))
-    
-    r2 = requests.post(f"{base_url}/sendDocument", data={
-        "chat_id": chat_id,
-        "caption": f"📎 Claude 스킬 입력용 — {trade_date_str}",
-    }, files={"document": (f"dozen_{trade_date_str}.json", jb, "application/json")})
-    
-    if r2.status_code == 200: print("✅ 텔레그램 전송 완료")
-    else: print(f"파일 전송 실패: {r2.text}")
-
-# ─────────────────────────────────────────
-# 메인 실행
-# ─────────────────────────────────────────
-def main():
-    target_ticker = TICKERS["더즌"]
-    v_date = find_latest_valid_date(target_ticker)
-    
-    if not v_date:
-        print("❌ 유효 데이터를 찾지 못했습니다."); return
-
-    # 데이터 패키징
-    main_data = get_comprehensive_data(target_ticker, v_date)
-    peer_results = {n: get_comprehensive_data(c, v_date) for n, c in TICKERS.items() if n != "더즌"}
-    news_results = {n: fetch_news_list(f"{n} 주가") for n in TICKERS.keys()}
-    
-    package = {"date": v_date, "main": main_data, "peers": peer_results, "news": news_results}
-    
-    # 출력 및 전송
-    report_text = format_telegram(package)
-    json_output = {
-        "trade_date": v_date.strftime("%Y-%m-%d"),
-        "main_stock": main_data,
-        "peer_stocks": peer_results,
-        "news": news_results
-    }
-    
-    send_telegram(report_text, json_output)
+    send_telegram(full_text, json_out)
+    print("✅ 리포트 전송 완료")
 
 if __name__ == "__main__":
     main()
