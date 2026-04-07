@@ -1,11 +1,27 @@
 """
-더즌(462860) 일간 주가 데이터 수집기 v4
-===========================================
-데이터 소스 전략 (GitHub Actions 검증 완료):
-  - OHLCV + 수급 + 거래대금: 핀업 (finance.finup.co.kr) — requests HTML 파싱
-  - 기술적 지표 (MA/RSI/BB/OBV/MACD): pykrx 이력 → 로컬 계산
-  - 공시: DART OpenAPI
-  - 뉴스: 네이버 뉴스 (수정된 URL)
+더즌(462860) 일간 주가 데이터 수집기 v5 (pykrx 표준 방식)
+=============================================================
+pykrx README 기준 정확한 사용:
+
+  거래대금 포함 OHLCV:
+    stock.get_market_ohlcv(fromdate, todate, ticker)
+    → 시가, 고가, 저가, 종가, 거래량, 거래대금, 등락률
+
+  수급 (순매수 거래량):
+    stock.get_market_trading_volume_by_date(fromdate, todate, ticker)
+    → 기관합계, 기타법인, 개인, 외국인합계, 전체
+
+  PER/PBR:
+    stock.get_market_fundamental(fromdate, todate, ticker)
+    → BPS, PER, PBR, EPS, DIV, DPS
+
+  시가총액:
+    stock.get_market_cap(fromdate, todate, ticker)
+    → 시가총액, 거래량, 거래대금, 상장주식수
+
+주의 (README 309줄):
+  당일 수급/거래대금 최종 확정치는 18:00 KST 이후 제공
+  → 18시 이전 실행 시 자동으로 전 거래일 조회
 
 환경변수 (GitHub Secrets):
   TELEGRAM_BOT_TOKEN
@@ -33,44 +49,30 @@ DART_CORP_CODES = {
 }
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://finance.finup.co.kr/",
-    "Accept-Language": "ko-KR,ko;q=0.9",
-}
-
 # ─────────────────────────────────────────
 # 날짜 헬퍼
 # ─────────────────────────────────────────
 def latest_trading_day(today: date) -> date:
     """거래일 계산 (KST 기준)
 
-    pykrx/핀업 수급 데이터 제공 기준 (pykrx README):
-      - 당일 최종 매매내역은 오후 6시(18:00 KST) 이후 제공
-      - 18:00 이전 실행 시 → 전 거래일 데이터 조회
-      - 18:00 이후 실행 시 → 당일 데이터 조회
+    pykrx README 309줄:
+      당일 수급/거래대금 최종 확정치는 18:00 KST 이후 제공
+      → 18시 이전 실행 시 전 거래일 조회
 
-    실행 시간별 동작:
-      평일 18:00 이전 → 전 거래일 (월요일이면 금요일)
-      평일 18:00 이후 → 당일
+    주말 처리:
       토/일 → 직전 금요일 (시간 무관)
     """
     d = today
     now_kst = datetime.utcnow() + timedelta(hours=9)
 
     if d.weekday() >= 5:
-        # 주말(토/일) → 직전 금요일, 시간 무관
+        # 주말 → 직전 금요일, 시간 무관
         while d.weekday() >= 5:
             d -= timedelta(days=1)
     else:
-        # 평일: KST 18:00 이전이면 전 거래일
+        # 평일: 18:00 이전이면 전 거래일
         if now_kst.hour < 18:
             d -= timedelta(days=1)
-            # 월요일 18시 이전 → 금요일로
             while d.weekday() >= 5:
                 d -= timedelta(days=1)
 
@@ -83,148 +85,103 @@ def display_date(d: date) -> str:
     days = ["월","화","수","목","금","토","일"]
     return d.strftime(f"%Y-%m-%d({days[d.weekday()]})")
 
-# ─────────────────────────────────────────
-# 핀업 파싱 헬퍼
-# ─────────────────────────────────────────
-def parse_amt(text: str) -> int:
-    """'150억 4,400만' 형태 → 원 단위 정수 변환"""
-    total = 0
-    m_eok = re.search(r'([\d,]+)억', text)
-    m_man = re.search(r'([\d,]+)만', text)
-    if m_eok:
-        total += int(m_eok.group(1).replace(',', '')) * 100_000_000
-    if m_man:
-        total += int(m_man.group(1).replace(',', '')) * 10_000
-    return total
-
-def parse_int(text: str) -> int:
-    """'4,173,334' → 4173334"""
-    return int(re.sub(r'[^\d]', '', text) or '0')
-
-def parse_signed_int(text: str) -> int:
-    """'-88,871' → -88871, '+64,611' → 64611"""
-    text = text.strip()
-    sign = -1 if text.startswith('-') else 1
-    return sign * int(re.sub(r'[^\d]', '', text) or '0')
 
 # ─────────────────────────────────────────
-# 1. 핀업에서 주가 + 수급 수집
+# 1. pykrx — OHLCV + 거래대금
 # ─────────────────────────────────────────
-def fetch_finup(ticker: str) -> dict:
-    """핀업에서 시가/고가/저가/거래량/거래대금 + 10일 시세/수급 파싱
-
-    README 분석 결과:
-    - pykrx adjusted=True(기본값) → 네이버 fchart → 거래대금 컬럼 없음
-    - pykrx 수급 API → KRX 직접 호출 → GitHub Actions IP 차단
-    - 따라서 거래대금·수급 모두 핀업에서 직접 수집
-    
-    패턴 설계 원칙:
-    - 원본 HTML / 마크다운 변환 텍스트 / 탭 구분 등 모든 형식에 대응하는 통합 패턴 사용
-    - 거래대금: "거래대금(원)" 이후 "X억 Y만" 형식 추출 (어떤 구분자든 대응)
-    - 수급: 날짜+숫자7개 통합 패턴 (HTML 태그 / 마크다운 테이블 / 탭 모두 대응)
+def fetch_ohlcv(ticker: str, trade_day: date) -> dict:
+    """README 2.1.1.2: get_market_ohlcv(fromdate, todate, ticker)
+    반환: 시가, 고가, 저가, 종가, 거래량, 거래대금, 등락률
     """
-    url = f"https://finance.finup.co.kr/Stock/{ticker}"
-    result = {
-        "시가": 0, "고가": 0, "저가": 0,
-        "거래량": 0, "거래대금": 0,
-        "기준일시": "",
-        "history": [],
-        "_source": "finup",
-    }
+    ds = strdate(trade_day)
+    try:
+        df = krx.get_market_ohlcv(ds, ds, ticker)
+        print(f"    [DEBUG] OHLCV shape={df.shape}, columns={list(df.columns)}")
+        if not df.empty:
+            row = df.iloc[-1]
+            return {
+                "시가":    int(row.get("시가", 0)),
+                "고가":    int(row.get("고가", 0)),
+                "저가":    int(row.get("저가", 0)),
+                "종가":    int(row.get("종가", 0)),
+                "거래량":  int(row.get("거래량", 0)),
+                "거래대금": int(row.get("거래대금", 0)),
+                "등락률":  float(row.get("등락률", 0.0)),
+            }
+        print(f"    [WARN] OHLCV 빈 DataFrame")
+    except Exception as e:
+        print(f"    [ERROR] OHLCV: {e}")
+    return {}
+
+
+# ─────────────────────────────────────────
+# 2. pykrx — 수급 (순매수 거래량)
+# ─────────────────────────────────────────
+def fetch_supply(ticker: str, trade_day: date) -> dict:
+    """README 2.1.1.8: get_market_trading_volume_by_date(fromdate, todate, ticker)
+    반환: 기관합계, 기타법인, 개인, 외국인합계, 전체
+    """
+    ds = strdate(trade_day)
+    try:
+        df = krx.get_market_trading_volume_by_date(ds, ds, ticker)
+        print(f"    [DEBUG] 수급 shape={df.shape}, columns={list(df.columns)}")
+        if not df.empty:
+            row = df.iloc[-1]
+            cols = list(df.columns)
+            # 컬럼명 동적 탐지 (README 기준: 개인, 외국인합계, 기관합계)
+            개인_col   = next((c for c in cols if c == "개인"), None)
+            외국인_col = next((c for c in cols if "외국인" in c), None)
+            기관_col   = next((c for c in cols if "기관" in c and "합계" in c), None)
+            result = {
+                "개인":   int(row[개인_col])   if 개인_col   else 0,
+                "외국인": int(row[외국인_col]) if 외국인_col else 0,
+                "기관":   int(row[기관_col])   if 기관_col   else 0,
+            }
+            print(f"    [DEBUG] 수급: {result}")
+            return result
+        print(f"    [WARN] 수급 빈 DataFrame")
+    except Exception as e:
+        print(f"    [ERROR] 수급: {e}")
+    return {"개인": 0, "외국인": 0, "기관": 0}
+
+
+# ─────────────────────────────────────────
+# 3. pykrx — 시가총액 + PER/PBR
+# ─────────────────────────────────────────
+def fetch_fundamentals(ticker: str, trade_day: date) -> dict:
+    """README 2.1.1.5/6: get_market_fundamental + get_market_cap"""
+    ds = strdate(trade_day)
+    result = {}
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.encoding = "utf-8"
-        html = resp.text
-
-        # ── 기준일시 ──────────────────────────────
-        dt_m = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*기준", html)
-        if dt_m:
-            result["기준일시"] = dt_m.group(1).strip()
-
-        # ── 시가/고가/저가 ─────────────────────────
-        # 원본 HTML: <td>시가</td>...<td>3,220</td> 또는 텍스트: "시가\n  3,220"
-        for label in ["시가", "고가", "저가"]:
-            m = re.search(rf"{label}[^\d]{{1,50}}?([\d,]{{4,}})", html, re.DOTALL)
-            if m:
-                val = parse_int(m.group(1))
-                if val > 0:
-                    result[label] = val
-
-        # ── 거래량 ────────────────────────────────
-        # "거래량" 다음 숫자 (쉼표 포함, 최소 6자리 이상 = 수십만 이상)
-        vol_m = re.search(r"거래량[^\d]{1,50}?([\d,]{6,})", html, re.DOTALL)
-        if vol_m:
-            result["거래량"] = parse_int(vol_m.group(1))
-
-        # ── 거래대금 ──────────────────────────────
-        # "거래대금(원)" 이후 "X억 Y만" 패턴 — 어떤 HTML 구조든 대응
-        amt_m = re.search(
-            r"거래대금\(원\)[^\d억만]{0,50}?([\d,]+억[\d\s,만]*)",
-            html, re.DOTALL
-        )
-        if amt_m:
-            result["거래대금"] = parse_amt(amt_m.group(1))
-
-        # ── 10일 시세 + 수급 테이블 ────────────────
-        # 통합 패턴: 날짜 + 숫자 7개 (구분자 무관 — HTML태그/마크다운/탭 모두 대응)
-        num_sep = r"[^\d-]+"
-        unified = (
-            r"(202\d-\d{2}-\d{2})" + num_sep +  # 날짜
-            r"([\d,]+)" + num_sep +                 # 종가
-            r"([\d,]+)" + num_sep +                 # 전일비
-            r"([+-][\d.]+%)" + num_sep +            # 등락률
-            r"([+-]?[\d,]+)" + num_sep +            # 개인
-            r"([+-]?[\d,]+)" + num_sep +            # 외국인
-            r"([+-]?[\d,]+)"                        # 기관
-        )
-        rows = re.findall(unified, html)
-        for row in rows[:10]:
-            result["history"].append({
-                "날짜":   row[0],
-                "종가":   parse_int(row[1]),
-                "전일비": parse_int(row[2]),
-                "등락률": row[3],
-                "개인":   parse_signed_int(row[4]),
-                "외국인": parse_signed_int(row[5]),
-                "기관":   parse_signed_int(row[6]),
-            })
-
+        df_cap = krx.get_market_cap(ds, ds, ticker)
+        print(f"    [DEBUG] 시가총액 shape={df_cap.shape}")
+        if not df_cap.empty:
+            row = df_cap.iloc[-1]
+            result["시가총액"] = int(row.get("시가총액", 0))
     except Exception as e:
-        result["_error"] = str(e)
-        print(f"    [WARN] 핀업 오류 ({ticker}): {e}")
+        print(f"    [ERROR] 시가총액: {e}")
+
+    try:
+        df_fund = krx.get_market_fundamental(ds, ds, ticker)
+        print(f"    [DEBUG] 펀더멘털 shape={df_fund.shape}")
+        if not df_fund.empty:
+            row = df_fund.iloc[-1]
+            per = float(row.get("PER", 0))
+            pbr = float(row.get("PBR", 0))
+            result["PER"] = per if per > 0 else "-"
+            result["PBR"] = pbr if pbr > 0 else "-"
+    except Exception as e:
+        print(f"    [ERROR] 펀더멘털: {e}")
 
     return result
 
 
 # ─────────────────────────────────────────
-# 2. pykrx OHLCV (종가·등락률)
+# 4. pykrx — 기술적 지표용 이력 수집
 # ─────────────────────────────────────────
-def fetch_ohlcv(ticker: str, trade_day: date) -> dict:
-    """pykrx로 당일 OHLCV. 내부적으로 네이버 fchart 사용."""
-    ds = strdate(trade_day)
-    try:
-        df = krx.get_market_ohlcv(ds, ds, ticker)
-        if not df.empty:
-            row = df.iloc[-1]
-            return {
-                "시가":   int(row.get("시가", 0)),
-                "고가":   int(row.get("고가", 0)),
-                "저가":   int(row.get("저가", 0)),
-                "종가":   int(row.get("종가", 0)),
-                "거래량": int(row.get("거래량", 0)),
-                "등락률": float(row.get("등락률", 0.0)),
-            }
-    except Exception as e:
-        print(f"    [WARN] pykrx OHLCV 오류 ({ticker}): {e}")
-    return {}
-
-
-# ─────────────────────────────────────────
-# 3. 기술적 지표 계산
-# ─────────────────────────────────────────
-def fetch_history_for_indicators(ticker: str, days: int = 60) -> list:
-    """pykrx로 60일 이력 (MA/RSI/BB/OBV/MACD 계산용)"""
+def fetch_history(ticker: str, days: int = 60) -> list:
+    """최근 60거래일 OHLCV 이력 (MA/RSI/BB/OBV/MACD 계산용)"""
     today = date.today()
     start = today - timedelta(days=days * 2)
     try:
@@ -243,9 +200,13 @@ def fetch_history_for_indicators(ticker: str, days: int = 60) -> list:
             })
         return records[-days:]
     except Exception as e:
-        print(f"    [WARN] 이력 수집 오류: {e}")
+        print(f"    [ERROR] 이력: {e}")
         return []
 
+
+# ─────────────────────────────────────────
+# 5. 기술적 지표 계산
+# ─────────────────────────────────────────
 def calc_ema(values: list, period: int) -> list:
     if len(values) < period:
         return []
@@ -270,10 +231,9 @@ def calc_technical_indicators(history: list) -> dict:
     # RSI(14)
     if len(closes) >= 15:
         deltas = [closes[i]-closes[i-1] for i in range(1, len(closes))]
-        gains  = [max(d,0) for d in deltas]
-        losses = [abs(min(d,0)) for d in deltas]
-        ag, al = sum(gains[-14:])/14, sum(losses[-14:])/14
-        rsi = 100.0 if al == 0 else round(100 - 100/(1 + ag/al), 2)
+        ag = sum(max(d,0) for d in deltas[-14:]) / 14
+        al = sum(abs(min(d,0)) for d in deltas[-14:]) / 14
+        rsi = 100.0 if al == 0 else round(100 - 100/(1+ag/al), 2)
         result["RSI14"] = rsi
         result["RSI14_signal"] = (
             "과매수 ⚠️" if rsi >= 70 else
@@ -287,8 +247,8 @@ def calc_technical_indicators(history: list) -> dict:
         std = (sum((c-ma)**2 for c in w)/20)**0.5
         bbu, bbl, bbm = round(ma+2*std), round(ma-2*std), round(ma)
         cur = closes[-1]
-        result.update({"BB_upper": bbu, "BB_mid": bbm, "BB_lower": bbl,
-                        "BB_width": round((bbu-bbl)/bbm*100, 2)})
+        result.update({"BB_upper":bbu, "BB_mid":bbm, "BB_lower":bbl,
+                        "BB_width":round((bbu-bbl)/bbm*100,2)})
         if cur >= bbu:
             result["BB_signal"] = f"상단 돌파 ⚠️ ({cur:,} ≥ {bbu:,})"
         elif cur <= bbl:
@@ -326,10 +286,10 @@ def calc_technical_indicators(history: list) -> dict:
             sv_list = [s for s in sig if s is not None]
             if sv_list:
                 mv, sv = macd[-1], round(sv_list[-1], 2)
-                hist = round(mv - sv, 2)
-                result.update({"MACD": mv, "MACD_signal": sv, "MACD_hist": hist})
+                hist = round(mv-sv, 2)
+                result.update({"MACD":mv, "MACD_signal":sv, "MACD_hist":hist})
                 if len(macd)>=2 and len(sv_list)>=2:
-                    ph = macd[-2] - sv_list[-2]
+                    ph = macd[-2]-sv_list[-2]
                     result["MACD_cross"] = (
                         "골든크로스 📈 (매수 신호)" if ph<=0 and hist>0 else
                         "데드크로스 📉 (매도 신호)" if ph>=0 and hist<0 else
@@ -340,14 +300,14 @@ def calc_technical_indicators(history: list) -> dict:
 
 
 # ─────────────────────────────────────────
-# 4. DART 공시
+# 6. DART 공시
 # ─────────────────────────────────────────
 def fetch_dart(corp_code: str, dart_key: str) -> list:
     end, start = date.today(), date.today() - timedelta(days=1)
     params = {
         "crtfc_key": dart_key, "corp_code": corp_code,
         "bgn_de": strdate(start), "end_de": strdate(end),
-        "page_no": "1", "page_count": "10",
+        "page_no":"1", "page_count":"10",
     }
     url = DART_LIST_URL + "?" + urllib.parse.urlencode(params)
     try:
@@ -366,26 +326,18 @@ def fetch_dart(corp_code: str, dart_key: str) -> list:
 
 
 # ─────────────────────────────────────────
-# 5. 뉴스
+# 7. 뉴스
 # ─────────────────────────────────────────
 def fetch_news(query: str, max_items: int = 20) -> list:
     """네이버 뉴스 — 최신순, 1일 이내"""
-    # URL을 직접 조합 (인코딩 문제 방지)
     base = "https://search.naver.com/search.naver"
     params = urllib.parse.urlencode({
-        "where": "news",
-        "query": query,
-        "sm": "tab_opt",
-        "sort": "1",
-        "nso": "so:dd,p:1d",
+        "where": "news", "query": query,
+        "sm": "tab_opt", "sort": "1", "nso": "so:dd,p:1d",
     })
     url = f"{base}?{params}"
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Referer": "https://search.naver.com/",
         "Accept-Language": "ko-KR,ko;q=0.9",
     }
@@ -409,12 +361,12 @@ def fetch_news(query: str, max_items: int = 20) -> list:
         print(f"    뉴스 {len(items)}건 수집 ('{query}')")
     except Exception as e:
         items.append({"_error": str(e)})
-        print(f"    [WARN] 뉴스 오류 ('{query}'): {e}")
+        print(f"    [WARN] 뉴스 오류: {e}")
     return items
 
 
 # ─────────────────────────────────────────
-# 6. 전체 수집
+# 8. 전체 수집
 # ─────────────────────────────────────────
 def collect_all() -> dict:
     today     = date.today()
@@ -431,70 +383,48 @@ def collect_all() -> dict:
         "이동평균": {}, "피어": {}, "공시": {}, "뉴스": {},
     }
 
-    # ── 더즌: 핀업 (시가/고가/저가/거래량/거래대금/수급) ──
     t = TICKERS["더즌"]
-    print("  ▶ 더즌 — 핀업 수집...")
-    finup = fetch_finup(t)
-    print(f"    기준: {finup.get('기준일시','?')} | 거래대금: {finup.get('거래대금',0):,}원 | 이력: {len(finup.get('history',[]))}건")
 
-    # ── 더즌: pykrx (당일 종가/등락률 확인용) ──
-    print("  ▶ 더즌 — pykrx OHLCV...")
+    # OHLCV + 거래대금
+    print("  ▶ OHLCV + 거래대금 (pykrx)...")
     ohlcv = fetch_ohlcv(t, trade_day)
-    print(f"    종가: {ohlcv.get('종가','?')} 등락률: {ohlcv.get('등락률','?')}%")
+    result["주가"] = ohlcv
+    print(f"    종가={ohlcv.get('종가','?')} 거래대금={ohlcv.get('거래대금','?')}")
 
-    # 데이터 병합 (핀업 우선, pykrx 보완)
-    result["주가"] = {
-        "시가":   finup.get("시가")   or ohlcv.get("시가", 0),
-        "고가":   finup.get("고가")   or ohlcv.get("고가", 0),
-        "저가":   finup.get("저가")   or ohlcv.get("저가", 0),
-        "종가":   ohlcv.get("종가")   or (finup["history"][0]["종가"] if finup.get("history") else 0),
-        "거래량": finup.get("거래량") or ohlcv.get("거래량", 0),
-        "거래대금": finup.get("거래대금", 0),
-        "등락률": ohlcv.get("등락률", 0.0),
-    }
+    # 수급
+    print("  ▶ 수급 (pykrx)...")
+    result["수급"] = fetch_supply(t, trade_day)
 
-    # 수급: 핀업 history 최신 행
-    if finup.get("history"):
-        latest = finup["history"][0]
-        result["수급"] = {
-            "개인":   latest.get("개인", 0),
-            "외국인": latest.get("외국인", 0),
-            "기관":   latest.get("기관", 0),
-        }
-        result["기본정보"]["기준일시"] = finup.get("기준일시", "")
+    # 시가총액/PER/PBR
+    print("  ▶ 기본정보 (pykrx)...")
+    result["기본정보"] = fetch_fundamentals(t, trade_day)
 
-    # ── 기술적 지표 ──────────────────────
+    # 기술적 지표
     print("  ▶ 기술적 지표 계산...")
-    history    = fetch_history_for_indicators(t, days=60)
+    history    = fetch_history(t, days=60)
     indicators = calc_technical_indicators(history)
     result["이동평균"] = {**indicators, "history_60d": history}
     print(f"    MA5={indicators.get('MA5','?')} RSI={indicators.get('RSI14','?')}")
 
-    # ── 피어: pykrx ──────────────────────
+    # 피어
     for name, pt in [("헥토파이낸셜", TICKERS["헥토파이낸셜"]),
                      ("쿠콘",         TICKERS["쿠콘"])]:
         print(f"  ▶ {name}...")
         p = fetch_ohlcv(pt, trade_day)
         result["피어"][name] = {
-            "종가":   p.get("종가", 0),
-            "등락률": p.get("등락률", 0.0),
-            "거래량": p.get("거래량", 0),
+            "종가": p.get("종가",0), "등락률": p.get("등락률",0.0), "거래량": p.get("거래량",0)
         }
         time.sleep(0.3)
 
-    # ── DART ─────────────────────────────
+    # DART
     print("  ▶ DART 공시...")
     for name, corp in DART_CORP_CODES.items():
         result["공시"][name] = fetch_dart(corp, dart_key) if dart_key else [{"_note":"DART_API_KEY 미설정"}]
         time.sleep(0.3)
 
-    # ── 뉴스 ─────────────────────────────
+    # 뉴스
     print("  ▶ 뉴스 수집...")
-    for name, q in [
-        ("더즌",        "더즌 462860"),
-        ("헥토파이낸셜", "헥토파이낸셜 주가"),
-        ("쿠콘",        "쿠콘 주가"),
-    ]:
+    for name, q in [("더즌","더즌 462860"),("헥토파이낸셜","헥토파이낸셜 주가"),("쿠콘","쿠콘 주가")]:
         result["뉴스"][name] = fetch_news(q, max_items=20)
         time.sleep(0.5)
 
@@ -503,18 +433,21 @@ def collect_all() -> dict:
 
 
 # ─────────────────────────────────────────
-# 7. 텔레그램 포맷 & 전송
+# 9. 텔레그램 전송
 # ─────────────────────────────────────────
 def format_telegram(data: dict) -> str:
     d    = data["_trade_date"]
     p    = data["주가"]
     s    = data["수급"]
     ma   = data["이동평균"]
+    info = data["기본정보"]
     chg  = p.get("등락률", 0)
     arrow = "📈" if chg > 0 else ("📉" if chg < 0 else "➡️")
 
     amt = p.get("거래대금", 0)
     amt_str = f"{amt/100_000_000:.1f}억" if amt >= 100_000_000 else (f"{amt//10_000}만" if amt > 0 else "-")
+    cap = info.get("시가총액", 0)
+    cap_str = f"{cap//100_000_000:,}억" if isinstance(cap, int) and cap > 0 else "-"
 
     lines = [
         f"📊 *더즌(462860) 일간 주가 리포트* — {d}",
@@ -537,8 +470,11 @@ def format_telegram(data: dict) -> str:
         f"  OBV: {ma.get('OBV_signal','-')}",
         f"  MACD: {ma.get('MACD','-')} / 시그널: {ma.get('MACD_signal','-')} — {ma.get('MACD_cross','')}",
         "",
-        "*👥 수급 (핀업 기준)*",
+        "*👥 수급*",
         f"  개인: {s.get('개인',0):+,}  외국인: {s.get('외국인',0):+,}  기관: {s.get('기관',0):+,}",
+        "",
+        "*🏢 기본정보*",
+        f"  시가총액: {cap_str}  PER: {info.get('PER','-')}  PBR: {info.get('PBR','-')}",
         "",
         "*🔗 피어 그룹*",
     ]
@@ -569,7 +505,7 @@ def format_telegram(data: dict) -> str:
             lines.append(f"  ▸ *{name}* ({len(real)}건)")
             for a in real:
                 press = f"[{a['언론사']}]" if a.get('언론사') else ""
-                t     = f" {a['시간']}"   if a.get('시간') else ""
+                t     = f" {a['시간']}"    if a.get('시간') else ""
                 lines.append(f"    {press}{t} {a.get('제목','')}")
                 lines.append(f"    {a.get('링크','')}")
     if not any_news:
@@ -626,22 +562,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ─────────────────────────────────────────
-# README 주요 발견사항 (pykrx 가이드 기반)
-# ─────────────────────────────────────────
-# 1. get_market_ohlcv(adjusted=True, 기본값):
-#    → 네이버 fchart 사용 → 거래대금 컬럼 없음 (시가/고가/저가/종가/거래량/등락률만)
-#    → GitHub Actions OK ✅
-#
-# 2. get_market_ohlcv(adjusted=False):
-#    → KRX 직접 호출 → 거래대금 있음 but GitHub Actions IP 차단 ❌
-#
-# 3. get_market_trading_volume/value_by_date:
-#    → KRX 직접 호출 (ISIN 조회 선행 필요) → GitHub Actions IP 차단 ❌
-#    → README: "당일자 최종 매매내역은 오후 6시 이후에 제공"
-#
-# 4. 해결책:
-#    - 거래대금·수급: 핀업(finance.finup.co.kr) 직접 크롤링
-#    - 시가/고가/저가/종가/거래량: pykrx (네이버 fchart 경유)
-#    - 기술적 지표(MA/RSI/BB/OBV/MACD): 60일 이력으로 로컬 계산
