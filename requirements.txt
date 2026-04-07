@@ -1,2 +1,4 @@
-pykrx>=1.0.47
-requests>=2.31.0
+pykrx
+requests
+beautifulsoup4
+lxml
