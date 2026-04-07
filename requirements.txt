@@ -1,4 +1,2 @@
-pykrx
-requests
-beautifulsoup4
-pandas
+pykrx>=1.0.47
+requests>=2.31.0
