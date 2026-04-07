@@ -39,7 +39,8 @@ DART_CORP_CODES = {
     "쿠콘":        "00798833",
 }
 
-NAVER_NEWS_URL = "https://search.naver.com/search.naver?where=news&query={query}&sort=1&pd=4&ds={ds}&de={de}"
+# 최신순 + 1일 필터 — 사용자 지정 URL
+NAVER_NEWS_URL = "https://search.naver.com/search.naver?where=news&query={query}&sm=tab_opt&sort=1&nso=so%3Add%2Cp%3A1d"
 DART_LIST_URL  = "https://opendart.fss.or.kr/api/list.json"
 
 # ─────────────────────────────────────────
@@ -65,24 +66,42 @@ def display_date(d: date) -> str:
 # 1. KRX 주가 데이터 (pykrx)
 # ─────────────────────────────────────────
 def fetch_price(ticker: str, trade_day: date) -> dict:
-    """종가·시가·고가·저가·거래량·거래대금·등락률 수집"""
+    """종가·시가·고가·저가·거래량·거래대금·등락률 수집
+    
+    pykrx 구조 주의:
+      get_market_ohlcv(from,to,ticker) → 시가/고가/저가/종가/거래량/등락률 (거래대금 없음!)
+      get_market_cap(from,to,ticker)   → 시가총액/거래량/거래대금/상장주식수
+      거래대금은 반드시 get_market_cap에서 별도 수집
+    """
     ds = strdate(trade_day)
     result = {}
+
+    # OHLCV (거래대금 없음)
     try:
         df = krx.get_market_ohlcv(ds, ds, ticker)
         if not df.empty:
             row = df.iloc[-1]
             result.update({
-                "시가":    int(row.get("시가", 0)),
-                "고가":    int(row.get("고가", 0)),
-                "저가":    int(row.get("저가", 0)),
-                "종가":    int(row.get("종가", 0)),
-                "거래량":  int(row.get("거래량", 0)),
-                "거래대금": int(row.get("거래대금", 0)),
-                "등락률":  float(row.get("등락률", 0.0)),
+                "시가":   int(row["시가"]),
+                "고가":   int(row["고가"]),
+                "저가":   int(row["저가"]),
+                "종가":   int(row["종가"]),
+                "거래량": int(row["거래량"]),
+                "등락률": float(row.get("등락률", 0.0)),
             })
     except Exception as e:
-        result["_price_error"] = str(e)
+        result["_ohlcv_error"] = str(e)
+
+    # 거래대금 + 시가총액: get_market_cap에서 수집
+    try:
+        df_cap = krx.get_market_cap(ds, ds, ticker)
+        if not df_cap.empty:
+            row = df_cap.iloc[-1]
+            result["거래대금"] = int(row["거래대금"])
+            result["시가총액"] = int(row["시가총액"])
+    except Exception as e:
+        result["_cap_error"] = str(e)
+
     return result
 
 
@@ -123,22 +142,30 @@ def fetch_fundamentals(ticker: str, trade_day: date) -> dict:
 
 
 def fetch_trading_volume(ticker: str, trade_day: date) -> dict:
-    """투자자별 수급(개인·외국인·기관) 수집
-    
-    pykrx 실제 컬럼명:
-      get_market_trading_volume_by_date 반환:
-        날짜, 기관합계, 기타법인, 개인, 외국인합계, 전체
+    """투자자별 수급(개인·외국인·기관) 순매수 수집
+
+    pykrx 실제 반환 구조:
+      get_market_trading_volume_by_date(from, to, ticker, on="순매수")
+      컬럼: 기관합계 / 기타법인 / 개인 / 외국인합계 / 전체
+      인덱스: 날짜 (DatetimeIndex)
+      => row["개인"] 방식으로 접근 (iloc[-1] 후 컬럼명 직접 접근)
     """
     ds = strdate(trade_day)
     result = {}
     try:
-        df = krx.get_market_trading_volume_by_date(ds, ds, ticker)
+        df = krx.get_market_trading_volume_by_date(ds, ds, ticker, on="순매수")
         if not df.empty:
             row = df.iloc[-1]
-            # 실제 컬럼명: 개인, 외국인합계, 기관합계
-            result["개인"]   = int(row.get("개인", 0))
-            result["외국인"] = int(row.get("외국인합계", row.get("외국인", 0)))
-            result["기관"]   = int(row.get("기관합계", 0))
+            cols = df.columns.tolist()
+            # 개인 컬럼 찾기 (정확한 컬럼명 보장)
+            개인_col   = next((c for c in cols if c == "개인"), None)
+            외국인_col = next((c for c in cols if "외국인" in c), None)
+            기관_col   = next((c for c in cols if "기관" in c and "합계" in c), None)
+
+            result["개인"]   = int(row[개인_col])   if 개인_col   else 0
+            result["외국인"] = int(row[외국인_col]) if 외국인_col else 0
+            result["기관"]   = int(row[기관_col])   if 기관_col   else 0
+            result["_supply_cols"] = cols  # 디버깅용
     except Exception as e:
         result["_supply_error"] = str(e)
     return result
@@ -373,18 +400,19 @@ def fetch_dart_disclosures(corp_code: str, dart_key: str, days: int = 1) -> list
 # ─────────────────────────────────────────
 # 3. 네이버 뉴스 크롤링
 # ─────────────────────────────────────────
-def fetch_naver_news(query: str, today: date, max_items: int = 5) -> list:
-    """네이버 뉴스 당일 기사 수집"""
-    ds = today.strftime("%Y.%m.%d")
-    url = NAVER_NEWS_URL.format(
-        query=urllib.parse.quote(query),
-        ds=ds, de=ds
-    )
+def fetch_naver_news(query: str, max_items: int = 20) -> list:
+    """네이버 뉴스 수집 — 최신순, 1일 이내, 필터 없이 전부 수집
+    
+    Claude 스킬에서 광고/중복/무의미 기사를 걸러냄
+    URL: 사용자 지정 최신순 1일 필터 URL
+    """
+    url = NAVER_NEWS_URL.format(query=urllib.parse.quote(query))
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://www.naver.com",
+        "Referer": "https://search.naver.com/",
+        "Accept-Language": "ko-KR,ko;q=0.9",
     }
     items = []
     try:
@@ -392,20 +420,25 @@ def fetch_naver_news(query: str, today: date, max_items: int = 5) -> list:
         with urllib.request.urlopen(req, timeout=10) as r:
             html = r.read().decode("utf-8", errors="replace")
 
-        # 제목 추출
+        # 제목 + 링크
         titles = re.findall(
             r'class="news_tit"[^>]*title="([^"]+)"[^>]*href="([^"]+)"',
             html
         )
-        # 요약 추출
-        descs = re.findall(r'class="dsc_txt_wrap">([^<]{10,200})<', html)
+        # 언론사
+        press_list = re.findall(r'class="info press">([^<]+)<', html)
+        # 날짜/시간
+        times = re.findall(r'class="info"[^>]*>\s*([^<]*(?:\d+분|\d+시간|어제|\d{4}\.\d{2}\.\d{2})[^<]*)<', html)
+        # 요약
+        descs = re.findall(r'class="dsc_txt_wrap">([^<]{10,300})<', html)
 
         for i, (title, link) in enumerate(titles[:max_items]):
-            desc = descs[i].strip() if i < len(descs) else ""
             items.append({
-                "제목": title,
-                "요약": desc[:100] + "..." if len(desc) > 100 else desc,
-                "링크": link,
+                "제목":   title,
+                "언론사": press_list[i].strip() if i < len(press_list) else "",
+                "시간":   times[i].strip()      if i < len(times)      else "",
+                "요약":   descs[i].strip()[:150] if i < len(descs)     else "",
+                "링크":   link,
             })
     except Exception as e:
         items.append({"_error": str(e)})
@@ -469,11 +502,15 @@ def collect_all() -> dict:
             result["공시"][name] = [{"_note": "DART_API_KEY 미설정"}]
         time.sleep(0.5)
 
-    # ── 네이버 뉴스 ──────────────────────
+    # ── 네이버 뉴스 (필터 없이 전부 수집, 스킬에서 정리) ──────
     print("  ▶ 뉴스 수집...")
-    for name in ["더즌", "헥토파이낸셜", "쿠콘"]:
-        query = f"{name} 주식" if name != "더즌" else "더즌 462860"
-        result["뉴스"][name] = fetch_naver_news(query, today, max_items=3)
+    news_queries = {
+        "더즌":        "더즌 462860",
+        "헥토파이낸셜": "헥토파이낸셜 주가",
+        "쿠콘":        "쿠콘 주가",
+    }
+    for name, query in news_queries.items():
+        result["뉴스"][name] = fetch_naver_news(query, max_items=20)
         time.sleep(0.5)
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 수집 완료")
@@ -555,15 +592,20 @@ def format_telegram(data: dict) -> str:
     if not any_disc:
         lines.append("  해당 없음")
 
-    # 뉴스
-    lines += ["", "*📰 오늘 뉴스*"]
+    # 뉴스 (언론사·시간 포함, 전체 첨부 — Claude 스킬에서 정리)
+    lines += ["", "*📰 오늘 뉴스 (원본 전체 — Claude가 정리)*"]
     any_news = False
     for name, articles in data["뉴스"].items():
         real = [a for a in articles if "_error" not in a]
         if real:
             any_news = True
+            lines.append(f"  ▸ *{name}* ({len(real)}건)")
             for a in real:
-                lines.append(f"  [{name}] {a.get('제목','')}")
+                press = a.get("언론사", "")
+                t     = a.get("시간", "")
+                press_str = f"[{press}]" if press else ""
+                time_str  = f" {t}"      if t     else ""
+                lines.append(f"    {press_str}{time_str} {a.get('제목','')}")
                 lines.append(f"    {a.get('링크','')}")
     if not any_news:
         lines.append("  해당 없음")
