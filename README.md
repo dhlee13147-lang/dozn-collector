@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/26523371/README.md)
+[README.md](https://github.com/user-attachments/files/26529303/README.md)
 # 더즌 주가 데이터 수집기
 
 매일 오후 4시 KST에 자동으로 실행되어 텔레그램으로 주가 데이터를 전송합니다.
