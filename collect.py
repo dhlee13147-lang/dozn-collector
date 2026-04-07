@@ -1,46 +1,32 @@
 """
-더즌(462860) 일간 주가 데이터 수집기 v5 (pykrx 표준 방식)
-=============================================================
-pykrx README 기준 정확한 사용:
+더즌(462860) 일간 주가 데이터 수집기 v6
+========================================
+데이터 소스 (로컬 테스트로 검증 완료):
+  - yfinance: OHLCV, 거래량, 시가총액, PER, PBR, 52주 고저, 이동평균
+  - pykrx: 60일 OHLCV 이력 → 기술적 지표 계산 (MA/RSI/BB/OBV/MACD)
+  - DART OpenAPI: 공시
+  - 네이버 뉴스: 기사
 
-  거래대금 포함 OHLCV:
-    stock.get_market_ohlcv(fromdate, todate, ticker)
-    → 시가, 고가, 저가, 종가, 거래량, 거래대금, 등락률
-
-  수급 (순매수 거래량):
-    stock.get_market_trading_volume_by_date(fromdate, todate, ticker)
-    → 기관합계, 기타법인, 개인, 외국인합계, 전체
-
-  PER/PBR:
-    stock.get_market_fundamental(fromdate, todate, ticker)
-    → BPS, PER, PBR, EPS, DIV, DPS
-
-  시가총액:
-    stock.get_market_cap(fromdate, todate, ticker)
-    → 시가총액, 거래량, 거래대금, 상장주식수
-
-주의 (README 309줄):
-  당일 수급/거래대금 최종 확정치는 18:00 KST 이후 제공
-  → 18시 이전 실행 시 자동으로 전 거래일 조회
+수급(개인/외국인/기관): yfinance 미제공 → 제외
+거래대금: Close × Volume으로 추정
 
 환경변수 (GitHub Secrets):
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
-  DART_API_KEY  (opendart.fss.or.kr — 무료)
+  DART_API_KEY
 """
 
 import os, json, re, time, urllib.request, urllib.parse
 from datetime import datetime, date, timedelta
 import requests
-from pykrx import stock as krx
 
 # ─────────────────────────────────────────
 # 설정
 # ─────────────────────────────────────────
-TICKERS = {
-    "더즌":        "462860",
-    "헥토파이낸셜": "234340",
-    "쿠콘":        "294570",
+YF_TICKERS = {
+    "더즌":        "462860.KQ",
+    "헥토파이낸셜": "234340.KQ",
+    "쿠콘":        "294570.KQ",
 }
 DART_CORP_CODES = {
     "더즌":        "01615947",
@@ -53,29 +39,17 @@ DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 # 날짜 헬퍼
 # ─────────────────────────────────────────
 def latest_trading_day(today: date) -> date:
-    """거래일 계산 (KST 기준)
-
-    pykrx README 309줄:
-      당일 수급/거래대금 최종 확정치는 18:00 KST 이후 제공
-      → 18시 이전 실행 시 전 거래일 조회
-
-    주말 처리:
-      토/일 → 직전 금요일 (시간 무관)
-    """
+    """KST 18:00 이전이면 전 거래일, 이후면 당일"""
     d = today
     now_kst = datetime.utcnow() + timedelta(hours=9)
-
     if d.weekday() >= 5:
-        # 주말 → 직전 금요일, 시간 무관
         while d.weekday() >= 5:
             d -= timedelta(days=1)
     else:
-        # 평일: 18:00 이전이면 전 거래일
         if now_kst.hour < 18:
             d -= timedelta(days=1)
             while d.weekday() >= 5:
                 d -= timedelta(days=1)
-
     return d
 
 def strdate(d: date) -> str:
@@ -87,101 +61,76 @@ def display_date(d: date) -> str:
 
 
 # ─────────────────────────────────────────
-# 1. pykrx — OHLCV + 거래대금
+# 1. yfinance — 주가 + 기본정보
 # ─────────────────────────────────────────
-def fetch_ohlcv(ticker: str, trade_day: date) -> dict:
-    """README 2.1.1.2: get_market_ohlcv(fromdate, todate, ticker)
-    반환: 시가, 고가, 저가, 종가, 거래량, 거래대금, 등락률
-    """
-    ds = strdate(trade_day)
-    try:
-        df = krx.get_market_ohlcv(ds, ds, ticker)
-        print(f"    [DEBUG] OHLCV shape={df.shape}, columns={list(df.columns)}")
-        if not df.empty:
-            row = df.iloc[-1]
-            return {
-                "시가":    int(row.get("시가", 0)),
-                "고가":    int(row.get("고가", 0)),
-                "저가":    int(row.get("저가", 0)),
-                "종가":    int(row.get("종가", 0)),
-                "거래량":  int(row.get("거래량", 0)),
-                "거래대금": int(row.get("거래대금", 0)),
-                "등락률":  float(row.get("등락률", 0.0)),
-            }
-        print(f"    [WARN] OHLCV 빈 DataFrame")
-    except Exception as e:
-        print(f"    [ERROR] OHLCV: {e}")
-    return {}
-
-
-# ─────────────────────────────────────────
-# 2. pykrx — 수급 (순매수 거래량)
-# ─────────────────────────────────────────
-def fetch_supply(ticker: str, trade_day: date) -> dict:
-    """README 2.1.1.8: get_market_trading_volume_by_date(fromdate, todate, ticker)
-    반환: 기관합계, 기타법인, 개인, 외국인합계, 전체
-    """
-    ds = strdate(trade_day)
-    try:
-        df = krx.get_market_trading_volume_by_date(ds, ds, ticker)
-        print(f"    [DEBUG] 수급 shape={df.shape}, columns={list(df.columns)}")
-        if not df.empty:
-            row = df.iloc[-1]
-            cols = list(df.columns)
-            # 컬럼명 동적 탐지 (README 기준: 개인, 외국인합계, 기관합계)
-            개인_col   = next((c for c in cols if c == "개인"), None)
-            외국인_col = next((c for c in cols if "외국인" in c), None)
-            기관_col   = next((c for c in cols if "기관" in c and "합계" in c), None)
-            result = {
-                "개인":   int(row[개인_col])   if 개인_col   else 0,
-                "외국인": int(row[외국인_col]) if 외국인_col else 0,
-                "기관":   int(row[기관_col])   if 기관_col   else 0,
-            }
-            print(f"    [DEBUG] 수급: {result}")
-            return result
-        print(f"    [WARN] 수급 빈 DataFrame")
-    except Exception as e:
-        print(f"    [ERROR] 수급: {e}")
-    return {"개인": 0, "외국인": 0, "기관": 0}
-
-
-# ─────────────────────────────────────────
-# 3. pykrx — 시가총액 + PER/PBR
-# ─────────────────────────────────────────
-def fetch_fundamentals(ticker: str, trade_day: date) -> dict:
-    """README 2.1.1.5/6: get_market_fundamental + get_market_cap"""
-    ds = strdate(trade_day)
+def fetch_yfinance(yf_ticker: str, trade_day: date) -> dict:
+    """yfinance로 OHLCV·시가총액·PER·PBR·52주 고저 수집"""
+    import yfinance as yf
     result = {}
-
     try:
-        df_cap = krx.get_market_cap(ds, ds, ticker)
-        print(f"    [DEBUG] 시가총액 shape={df_cap.shape}")
-        if not df_cap.empty:
-            row = df_cap.iloc[-1]
-            result["시가총액"] = int(row.get("시가총액", 0))
-    except Exception as e:
-        print(f"    [ERROR] 시가총액: {e}")
+        t = yf.Ticker(yf_ticker)
 
-    try:
-        df_fund = krx.get_market_fundamental(ds, ds, ticker)
-        print(f"    [DEBUG] 펀더멘털 shape={df_fund.shape}")
-        if not df_fund.empty:
-            row = df_fund.iloc[-1]
-            per = float(row.get("PER", 0))
-            pbr = float(row.get("PBR", 0))
-            result["PER"] = per if per > 0 else "-"
-            result["PBR"] = pbr if pbr > 0 else "-"
+        # ── fast_info (빠른 실시간 정보) ────────────
+        fi = t.fast_info
+        result["시가총액"]     = int(fi.market_cap) if fi.market_cap else 0
+        result["52주최고"]     = float(fi.year_high) if fi.year_high else 0
+        result["52주최저"]     = float(fi.year_low)  if fi.year_low  else 0
+        result["50일이동평균"] = float(fi.fifty_day_average)     if fi.fifty_day_average     else 0
+        result["200일이동평균"]= float(fi.two_hundred_day_average) if fi.two_hundred_day_average else 0
+
+        # ── 최근 5일 history → 당일 OHLCV ───────────
+        hist = t.history(period="5d")
+        if not hist.empty:
+            # trade_day에 해당하는 행 찾기 (timezone-aware index 대응)
+            hist.index = hist.index.tz_localize(None) if hist.index.tz is None else hist.index.tz_convert(None)
+            target = trade_day.strftime("%Y-%m-%d")
+            day_rows = hist[hist.index.strftime("%Y-%m-%d") == target]
+
+            if day_rows.empty:
+                # 당일 데이터 없으면 가장 최근 행 사용
+                day_rows = hist.tail(1)
+
+            row = day_rows.iloc[-1]
+            result["시가"]   = int(row["Open"])
+            result["고가"]   = int(row["High"])
+            result["저가"]   = int(row["Low"])
+            result["종가"]   = int(row["Close"])
+            result["거래량"] = int(row["Volume"])
+            # 거래대금 추정 (종가 × 거래량)
+            result["거래대금"] = int(row["Close"] * row["Volume"])
+
+            # 전일 종가 → 등락률 계산
+            if len(hist) >= 2:
+                prev_close = float(hist.iloc[-2]["Close"])
+                result["전일종가"] = int(prev_close)
+                if prev_close > 0:
+                    result["등락률"] = round((result["종가"] - prev_close) / prev_close * 100, 2)
+
+        # ── info (PER·PBR) ───────────────────────────
+        try:
+            info = t.info
+            per = info.get("trailingPE") or info.get("forwardPE")
+            pbr = info.get("priceToBook")
+            result["PER"] = round(float(per), 2) if per else "-"
+            result["PBR"] = round(float(pbr), 2) if pbr else "-"
+        except Exception:
+            result["PER"] = "-"
+            result["PBR"] = "-"
+
+        print(f"    종가={result.get('종가','?')} 거래량={result.get('거래량','?'):,} 시가총액={result.get('시가총액',0)//100_000_000:,}억")
+
     except Exception as e:
-        print(f"    [ERROR] 펀더멘털: {e}")
+        print(f"    [ERROR] yfinance ({yf_ticker}): {e}")
 
     return result
 
 
 # ─────────────────────────────────────────
-# 4. pykrx — 기술적 지표용 이력 수집
+# 2. pykrx — 60일 이력 (기술적 지표용)
 # ─────────────────────────────────────────
 def fetch_history(ticker: str, days: int = 60) -> list:
-    """최근 60거래일 OHLCV 이력 (MA/RSI/BB/OBV/MACD 계산용)"""
+    """pykrx 네이버fchart로 60일 OHLCV 이력"""
+    from pykrx import stock as krx
     today = date.today()
     start = today - timedelta(days=days * 2)
     try:
@@ -205,7 +154,7 @@ def fetch_history(ticker: str, days: int = 60) -> list:
 
 
 # ─────────────────────────────────────────
-# 5. 기술적 지표 계산
+# 3. 기술적 지표 계산
 # ─────────────────────────────────────────
 def calc_ema(values: list, period: int) -> list:
     if len(values) < period:
@@ -286,28 +235,28 @@ def calc_technical_indicators(history: list) -> dict:
             sv_list = [s for s in sig if s is not None]
             if sv_list:
                 mv, sv = macd[-1], round(sv_list[-1], 2)
-                hist = round(mv-sv, 2)
-                result.update({"MACD":mv, "MACD_signal":sv, "MACD_hist":hist})
+                hist_val = round(mv-sv, 2)
+                result.update({"MACD":mv, "MACD_signal":sv, "MACD_hist":hist_val})
                 if len(macd)>=2 and len(sv_list)>=2:
                     ph = macd[-2]-sv_list[-2]
                     result["MACD_cross"] = (
-                        "골든크로스 📈 (매수 신호)" if ph<=0 and hist>0 else
-                        "데드크로스 📉 (매도 신호)" if ph>=0 and hist<0 else
-                        "MACD > 시그널 (강세 유지)" if hist>0 else
+                        "골든크로스 📈 (매수 신호)" if ph<=0 and hist_val>0 else
+                        "데드크로스 📉 (매도 신호)" if ph>=0 and hist_val<0 else
+                        "MACD > 시그널 (강세 유지)" if hist_val>0 else
                         "MACD < 시그널 (약세 유지)"
                     )
     return result
 
 
 # ─────────────────────────────────────────
-# 6. DART 공시
+# 4. DART 공시
 # ─────────────────────────────────────────
 def fetch_dart(corp_code: str, dart_key: str) -> list:
     end, start = date.today(), date.today() - timedelta(days=1)
     params = {
         "crtfc_key": dart_key, "corp_code": corp_code,
         "bgn_de": strdate(start), "end_de": strdate(end),
-        "page_no":"1", "page_count":"10",
+        "page_no": "1", "page_count": "10",
     }
     url = DART_LIST_URL + "?" + urllib.parse.urlencode(params)
     try:
@@ -326,10 +275,9 @@ def fetch_dart(corp_code: str, dart_key: str) -> list:
 
 
 # ─────────────────────────────────────────
-# 7. 뉴스
+# 5. 뉴스
 # ─────────────────────────────────────────
 def fetch_news(query: str, max_items: int = 20) -> list:
-    """네이버 뉴스 — 최신순, 1일 이내"""
     base = "https://search.naver.com/search.naver"
     params = urllib.parse.urlencode({
         "where": "news", "query": query,
@@ -337,7 +285,7 @@ def fetch_news(query: str, max_items: int = 20) -> list:
     })
     url = f"{base}?{params}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": "https://search.naver.com/",
         "Accept-Language": "ko-KR,ko;q=0.9",
     }
@@ -358,15 +306,15 @@ def fetch_news(query: str, max_items: int = 20) -> list:
                 "요약":   descs[i].strip()[:150] if i < len(descs) else "",
                 "링크":   link,
             })
-        print(f"    뉴스 {len(items)}건 수집 ('{query}')")
+        print(f"    뉴스 {len(items)}건 ('{query}')")
     except Exception as e:
         items.append({"_error": str(e)})
-        print(f"    [WARN] 뉴스 오류: {e}")
+        print(f"    [WARN] 뉴스: {e}")
     return items
 
 
 # ─────────────────────────────────────────
-# 8. 전체 수집
+# 6. 전체 수집
 # ─────────────────────────────────────────
 def collect_all() -> dict:
     today     = date.today()
@@ -379,51 +327,60 @@ def collect_all() -> dict:
         "_collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "_trade_date":   trade_day.strftime("%Y-%m-%d"),
         "_report_type":  "daily",
-        "주가": {}, "수급": {}, "기본정보": {},
+        "주가": {}, "기본정보": {},
         "이동평균": {}, "피어": {}, "공시": {}, "뉴스": {},
     }
 
-    t = TICKERS["더즌"]
+    # ── 더즌: yfinance ───────────────────────────────
+    print("  ▶ 더즌 — yfinance...")
+    yf_data = fetch_yfinance(YF_TICKERS["더즌"], trade_day)
+    result["주가"] = {
+        "시가":    yf_data.get("시가", 0),
+        "고가":    yf_data.get("고가", 0),
+        "저가":    yf_data.get("저가", 0),
+        "종가":    yf_data.get("종가", 0),
+        "거래량":  yf_data.get("거래량", 0),
+        "거래대금": yf_data.get("거래대금", 0),
+        "등락률":  yf_data.get("등락률", 0.0),
+        "전일종가": yf_data.get("전일종가", 0),
+    }
+    result["기본정보"] = {
+        "시가총액":       yf_data.get("시가총액", 0),
+        "PER":           yf_data.get("PER", "-"),
+        "PBR":           yf_data.get("PBR", "-"),
+        "52주최고":       yf_data.get("52주최고", 0),
+        "52주최저":       yf_data.get("52주최저", 0),
+        "50일이동평균":   yf_data.get("50일이동평균", 0),
+        "200일이동평균":  yf_data.get("200일이동평균", 0),
+    }
 
-    # OHLCV + 거래대금
-    print("  ▶ OHLCV + 거래대금 (pykrx)...")
-    ohlcv = fetch_ohlcv(t, trade_day)
-    result["주가"] = ohlcv
-    print(f"    종가={ohlcv.get('종가','?')} 거래대금={ohlcv.get('거래대금','?')}")
-
-    # 수급
-    print("  ▶ 수급 (pykrx)...")
-    result["수급"] = fetch_supply(t, trade_day)
-
-    # 시가총액/PER/PBR
-    print("  ▶ 기본정보 (pykrx)...")
-    result["기본정보"] = fetch_fundamentals(t, trade_day)
-
-    # 기술적 지표
-    print("  ▶ 기술적 지표 계산...")
-    history    = fetch_history(t, days=60)
+    # ── 기술적 지표 (pykrx 60일 이력) ────────────────
+    print("  ▶ 기술적 지표 (pykrx 60일 이력)...")
+    history    = fetch_history("462860", days=60)
     indicators = calc_technical_indicators(history)
     result["이동평균"] = {**indicators, "history_60d": history}
     print(f"    MA5={indicators.get('MA5','?')} RSI={indicators.get('RSI14','?')}")
 
-    # 피어
-    for name, pt in [("헥토파이낸셜", TICKERS["헥토파이낸셜"]),
-                     ("쿠콘",         TICKERS["쿠콘"])]:
+    # ── 피어: yfinance ────────────────────────────────
+    for name, yf_t in [("헥토파이낸셜", YF_TICKERS["헥토파이낸셜"]),
+                       ("쿠콘",         YF_TICKERS["쿠콘"])]:
         print(f"  ▶ {name}...")
-        p = fetch_ohlcv(pt, trade_day)
+        p = fetch_yfinance(yf_t, trade_day)
         result["피어"][name] = {
-            "종가": p.get("종가",0), "등락률": p.get("등락률",0.0), "거래량": p.get("거래량",0)
+            "종가":   p.get("종가", 0),
+            "등락률": p.get("등락률", 0.0),
+            "거래량": p.get("거래량", 0),
         }
-        time.sleep(0.3)
+        time.sleep(0.5)
 
-    # DART
+    # ── DART ──────────────────────────────────────────
     print("  ▶ DART 공시...")
     for name, corp in DART_CORP_CODES.items():
         result["공시"][name] = fetch_dart(corp, dart_key) if dart_key else [{"_note":"DART_API_KEY 미설정"}]
         time.sleep(0.3)
 
-    # 뉴스
-    print("  ▶ 뉴스 수집...")
+    # ── 뉴스 ──────────────────────────────────────────
+    print("  ▶ 뉴스...")
     for name, q in [("더즌","더즌 462860"),("헥토파이낸셜","헥토파이낸셜 주가"),("쿠콘","쿠콘 주가")]:
         result["뉴스"][name] = fetch_news(q, max_items=20)
         time.sleep(0.5)
@@ -433,12 +390,11 @@ def collect_all() -> dict:
 
 
 # ─────────────────────────────────────────
-# 9. 텔레그램 전송
+# 7. 텔레그램 전송
 # ─────────────────────────────────────────
 def format_telegram(data: dict) -> str:
     d    = data["_trade_date"]
     p    = data["주가"]
-    s    = data["수급"]
     ma   = data["이동평균"]
     info = data["기본정보"]
     chg  = p.get("등락률", 0)
@@ -455,11 +411,12 @@ def format_telegram(data: dict) -> str:
         f"*{arrow} 주가 요약*",
         f"  종가: {p.get('종가',0):,}원  ({chg:+.2f}%)",
         f"  시가: {p.get('시가',0):,}  고가: {p.get('고가',0):,}  저가: {p.get('저가',0):,}",
-        f"  거래량: {p.get('거래량',0):,}주  거래대금: {amt_str}",
+        f"  거래량: {p.get('거래량',0):,}주  거래대금(추정): {amt_str}",
         "",
-        "*📐 이동평균*",
+        "*📐 이동평균 (pykrx 계산)*",
         (f"  MA5: {ma['MA5']:,}  MA10: {ma['MA10']:,}  MA20: {ma['MA20']:,}"
          if ma.get('MA5') else "  이동평균 계산 중"),
+        f"  50일MA: {info.get('50일이동평균',0):,.0f}  200일MA: {info.get('200일이동평균',0):,.0f}  (yfinance)",
         "",
         "*📊 기술적 지표*",
         f"  RSI(14): {ma.get('RSI14','-')} — {ma.get('RSI14_signal','')}",
@@ -470,11 +427,9 @@ def format_telegram(data: dict) -> str:
         f"  OBV: {ma.get('OBV_signal','-')}",
         f"  MACD: {ma.get('MACD','-')} / 시그널: {ma.get('MACD_signal','-')} — {ma.get('MACD_cross','')}",
         "",
-        "*👥 수급*",
-        f"  개인: {s.get('개인',0):+,}  외국인: {s.get('외국인',0):+,}  기관: {s.get('기관',0):+,}",
-        "",
-        "*🏢 기본정보*",
+        "*🏢 기본정보 (yfinance)*",
         f"  시가총액: {cap_str}  PER: {info.get('PER','-')}  PBR: {info.get('PBR','-')}",
+        f"  52주 최고: {info.get('52주최고',0):,}  최저: {info.get('52주최저',0):,}",
         "",
         "*🔗 피어 그룹*",
     ]
@@ -485,14 +440,15 @@ def format_telegram(data: dict) -> str:
 
     # 공시
     lines += ["", "*📋 오늘 공시*"]
-    any_disc = False
-    for name, discs in data["공시"].items():
-        real = [d for d in discs if "_error" not in d and "_note" not in d]
-        if real:
-            any_disc = True
-            for disc in real:
+    any_disc = any(
+        [d for d in discs if "_error" not in d and "_note" not in d]
+        for discs in data["공시"].values()
+    )
+    if any_disc:
+        for name, discs in data["공시"].items():
+            for disc in [d for d in discs if "_error" not in d and "_note" not in d]:
                 lines.append(f"  [{name}] {disc.get('보고서','')} — {disc.get('URL','')}")
-    if not any_disc:
+    else:
         lines.append("  해당 없음")
 
     # 뉴스
@@ -513,8 +469,7 @@ def format_telegram(data: dict) -> str:
 
     lines += [
         "", "─────────────────────",
-        "📌 _Claude 스킬 사용법_",
-        "_JSON 파일을 Claude 채팅에 붙여넣고_",
+        "📌 _JSON 파일을 Claude 채팅에 붙여넣고_",
         "_\"일간 리포트 노션에 올려줘\" 입력_",
     ]
     return "\n".join(l for l in lines if l is not None)
@@ -526,8 +481,6 @@ def send_telegram(text: str, json_data: dict):
     if not token or not chat_id:
         print("\n" + "="*60)
         print(text)
-        print("\n[JSON]")
-        print(json.dumps(json_data, ensure_ascii=False, indent=2))
         return
     base = f"https://api.telegram.org/bot{token}"
     r1 = requests.post(f"{base}/sendMessage", json={
@@ -547,9 +500,6 @@ def send_telegram(text: str, json_data: dict):
         print("✅ 텔레그램 전송 완료")
 
 
-# ─────────────────────────────────────────
-# 메인
-# ─────────────────────────────────────────
 def main():
     data = collect_all()
     text = format_telegram(data)
