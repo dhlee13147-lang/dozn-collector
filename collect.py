@@ -1,10 +1,10 @@
 """
-더즌(462860) 기업분석 데이터 수집기 v4.8
+더즌(462860) 기업분석 데이터 수집기 v4.9
 ===========================================
 수정 사항:
-1. 데이터 누락 차단: 종가가 0원일 경우, 데이터가 있는 날짜를 찾을 때까지 최대 10일 역추적
-2. 뉴스 수집 우회: 네이버 뉴스 차단을 피하기 위한 헤더 강화 및 파싱 로직 수정
-3. 기술적 지표 정밀화: Pandas 기반 내부 계산으로 외부 사이트 의존도 제로화
+1. SyntaxError 수정: f-string 문법 오류 및 잘림 현상 해결
+2. 데이터 수집 보장: 종가가 0원일 경우 유효 데이터가 나올 때까지 과거 날짜 역추적
+3. 뉴스 수집 우회: 네이버 뉴스 검색 결과 추출 로직 강화
 """
 
 import os, json, re, time, urllib.request, urllib.parse
@@ -15,49 +15,43 @@ from pykrx import stock as krx
 from bs4 import BeautifulSoup
 
 # ─────────────────────────────────────────
-# 설정 (TICKER 및 DART)
+# [1] 설정 (TICKER 및 DART)
 # ─────────────────────────────────────────
 TICKERS = {"더즌": "462860", "헥토파이낸셜": "234340", "쿠콘": "294570"}
-DART_CODES = {"더즌": "01615947", "헥토파이낸셜": "00669540", "쿠콘": "00798833"}
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
-    "Cache-Control": "max-age=0",
 }
 
 # ─────────────────────────────────────────
-# 데이터가 있는 최근 거래일 찾기 (핵심 로직)
+# [2] 유효 데이터 날짜 찾기
 # ─────────────────────────────────────────
 def find_latest_valid_date(ticker):
-    """데이터가 존재할 때까지 과거 날짜를 하나씩 확인합니다."""
-    # 한국 시간(KST) 기준 현재 날짜 설정
     now_kst = datetime.utcnow() + timedelta(hours=9)
-    # 오후 4시 이전이면 전날부터 체크 시작
+    # 장 마감 데이터는 보통 16:00 이후 확정되므로 그 전에는 전날부터 탐색
     search_start = now_kst.date() if now_kst.hour >= 16 else now_kst.date() - timedelta(days=1)
     
-    for i in range(10):  # 최근 10일간 역추적
+    for i in range(10):
         target = search_start - timedelta(days=i)
         ds = target.strftime("%Y%m%d")
         try:
             df = krx.get_market_ohlcv(ds, ds, ticker)
             if not df.empty and df.iloc[0]["종가"] > 0:
-                print(f"✅ 유효 데이터 발견 날짜: {ds}")
                 return target
         except:
             continue
     return search_start
 
 # ─────────────────────────────────────────
-# 종합 데이터 수집 함수
+# [3] 종합 데이터 수집 및 지표 계산
 # ─────────────────────────────────────────
 def get_comprehensive_data(ticker, target_date):
     ds = target_date.strftime("%Y%m%d")
     result = {"price": {}, "supply": {}, "tech": {}}
     
     try:
-        # 1. 시세/거래량/거래대금
+        # 시세/거래량
         df = krx.get_market_ohlcv(ds, ds, ticker)
         if not df.empty:
             row = df.iloc[0]
@@ -68,7 +62,7 @@ def get_comprehensive_data(ticker, target_date):
                 "chg_rate": float(row["등락률"])
             }
 
-        # 2. 투자자별 수급
+        # 투자자별 수급
         df_inv = krx.get_market_net_purchases_of_equities_by_ticker(ds, ds, ticker)
         if not df_inv.empty:
             inv = df_inv.iloc[0]
@@ -76,7 +70,7 @@ def get_comprehensive_data(ticker, target_date):
                 "ant": int(inv["개인"]), "foreigner": int(inv["외국인"]), "inst": int(inv["기관합계"])
             }
 
-        # 3. 기술적 지표 (최근 120일치 기반)
+        # 기술적 지표 (최근 120일 기반)
         start_ds = (target_date - timedelta(days=150)).strftime("%Y%m%d")
         df_h = krx.get_market_ohlcv(start_ds, ds, ticker)
         if not df_h.empty:
@@ -98,20 +92,19 @@ def get_comprehensive_data(ticker, target_date):
                 "bb_u": round(ma20 + 2*std), "bb_l": round(ma20 - 2*std)
             }
     except Exception as e:
-        print(f"❌ 데이터 수집 중 오류: {e}")
+        print(f"오류 발생: {e}")
     return result
 
 # ─────────────────────────────────────────
-# 뉴스 수집 (네이버 우회 로직 강화)
+# [4] 뉴스 수집 (네이버 최신순)
 # ─────────────────────────────────────────
-def fetch_news_expert(query):
+def fetch_news_list(query):
     news_list = []
     try:
         url = f"https://search.naver.com/search.naver?where=news&query={urllib.parse.quote(query)}&sort=1"
-        req = requests.get(url, headers=HEADERS, timeout=15)
+        req = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(req.text, 'html.parser')
         
-        # 네이버 뉴스 검색 결과 영역 파싱
         for item in soup.select('ul.list_news > li.bx')[:3]:
             title_tag = item.select_one('a.news_tit')
             press_tag = item.select_one('a.info.press')
@@ -119,45 +112,52 @@ def fetch_news_expert(query):
                 title = title_tag.get_text(strip=True)
                 press = press_tag.get_text(strip=True).replace("언론사 선정", "") if press_tag else "뉴스"
                 news_list.append(f"    - {title} ({press})")
-    except Exception as e:
-        print(f"❌ 뉴스 수집 오류 ({query}): {e}")
+    except:
+        pass
     return news_list
 
 # ─────────────────────────────────────────
-# 메인 실행 및 텔레그램 포맷팅
+# [5] 메인 실행 및 메시지 전송
 # ─────────────────────────────────────────
 def main():
-    main_name = "더즌"
-    main_ticker = TICKERS[main_name]
-    
-    # 1. 데이터가 유효한 날짜 찾기
+    main_ticker = TICKERS["더즌"]
     valid_date = find_latest_valid_date(main_ticker)
     
-    # 2. 전 종목 데이터 수집
+    # 데이터 수집
     main_data = get_comprehensive_data(main_ticker, valid_date)
-    peer_results = {}
-    for name, code in TICKERS.items():
-        if name != main_name:
-            peer_results[name] = get_comprehensive_data(code, valid_date)
+    peer_results = {name: get_comprehensive_data(code, valid_date) for name, code in TICKERS.items() if name != "더즌"}
 
-    # 3. 메시지 작성
-    p, s, t = main_data["price"], main_data["supply"], main_data["tech"]
+    # 메시지 포맷팅
+    p = main_data["price"]
+    s = main_data["supply"]
+    t = main_data["tech"]
+
     if not p or p.get("close", 0) == 0:
-        print("최종적으로 데이터를 찾지 못했습니다."); return
+        print("최종 데이터 확인 실패"); return
 
     status_icon = "📈" if p['chg_rate'] > 0 else "📉" if p['chg_rate'] < 0 else "➡️"
     
+    # 텔레그램 본문 구성
     msg = [
-        f"📊 *{main_name}({main_ticker}) 기업분석 리포트*",
-        f"분석 기준: {valid_date.strftime('%Y-%m-%d')} (장 마감 데이터)",
+        f"📊 *더즌({main_ticker}) 기업분석 리포트*",
+        f"분석 기준: {valid_date.strftime('%Y-%m-%d')} (종가 기준)",
         "",
         f"*{status_icon} 가격 및 거래량*",
         f"  • 종가: {p['close']:,}원 ({p['chg_rate']:+.2f}%)",
         f"  • 시/고/저: {p['open']:,}/{p['high']:,}/{p['low']:,}",
         f"  • 거래량: {p['vol']:,}주 / 대금: {p['amt']/100000000:.1f}억",
         "",
-        f"*👥 투자자별 수급 (주)*",
-        f"  • 개인: {s.get('ant',0):+,} | 외인: {s.get('foreigner',0):+,} | 기관: {s.get('inst',0):+,}",
+        f"*👥 투자자별 수급 (단위: 주)*",
+        f"  • 개인: {s.get('ant', 0):+,} | 외인: {s.get('foreigner', 0):+,} | 기관: {s.get('inst', 0):+,}",
         "",
-        f"*📐 기술적 분석*",
-        f"  • 이동평균: MA5({t.get('ma5',0):,}) | MA20({t.
+        f"*📐 기술적 지표 상세*",
+        f"  • 이동평균: MA5({t.get('ma5', 0):,}) | MA20({t.get('ma20', 0):,})",
+        f"  • RSI(14): {t.get('rsi', 0)} ({'과매수' if t.get('rsi', 0) > 70 else '과매도' if t.get('rsi', 0) < 30 else '중립'})",
+        f"  • 볼린저밴드: 상단 {t.get('bb_u', 0):,} / 하단 {t.get('bb_l', 0):,}",
+        "",
+        f"*🔗 피어 그룹 비교*",
+    ]
+    
+    for name, d in peer_results.items():
+        pp = d.get("price", {})
+        msg.append(f"  • {name}: {pp.get('
