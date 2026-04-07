@@ -1,8 +1,10 @@
 """
-더즌(462860) 기업분석 데이터 수집기 v4.522===================================================
-- 데이터 소스: FinanceDataReader(fdr) + pykrx 보완
-- 명세서 반영: ACC_TRDVAL(거래대금), ACC_TRDVOL(거래량) 데이터 매핑 완료 
-- 안정성: f-string 및 조건문 잘림 현상을 방지하기 위해 구조 단순화
+더즌(462860) 기업분석 데이터 수집기 v4.23
+===================================================
+- 오류 수정: pip 설치 오류 해결 (financedatareader 소문자 적용)
+- 명세서 반영: ACC_TRDVAL(거래대금), ACC_TRDVOL(거래량) 데이터 매핑 
+- 데이터 소스: FinanceDataReader + pykrx 하이브리드
+- 전송 로직: 기존 성공했던 텔레그램 바이너리 전송 방식 적용
 """
 
 import os, json, re, time, urllib.request, urllib.parse
@@ -17,39 +19,35 @@ from bs4 import BeautifulSoup
 TICKERS = {"더즌": "462860", "헥토파이낸셜": "234340", "쿠콘": "294570"}
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
 
-# [2] 유효 거래일 탐색 (fdr 활용으로 속도 개선)
+# [2] 유효 거래일 탐색
 def find_latest_valid_date(ticker):
     now_kst = datetime.utcnow() + timedelta(hours=9)
-    # 오후 4시 이전이면 전날 데이터부터 확인
     end_date = now_kst.date() if now_kst.hour >= 16 else now_kst.date() - timedelta(days=1)
     start_date = end_date - timedelta(days=10)
-    
     try:
         df = fdr.DataReader(ticker, start_date, end_date)
         if not df.empty:
             return df.index[-1].to_pydatetime().date()
-    except:
-        pass
+    except: pass
     return end_date
 
-# [3] 데이터 수집 (fdr 기반 시세 + pykrx 기반 수급) 
+# [3] 데이터 수집 (명세서 규격 ACC_TRDVAL, ACC_TRDVOL 반영)
 def get_comprehensive_data(ticker, target_date):
     ds = target_date.strftime("%Y%m%d")
     res = {"price": {"close": 0, "rate": 0.0, "vol": 0, "amt": 0}, "supply": {"ant": 0, "foreigner": 0, "inst": 0}, "tech": {}}
-    
     try:
-        # fdr로 시세 및 거래량/대금 수집 (명세서 규격 ACC_TRDVOL, ACC_TRDVAL 대응) 
+        # fdr 시세 수집 (거래량: ACC_TRDVOL, 거래대금: ACC_TRDVAL 대응) 
         df_price = fdr.DataReader(ticker, target_date, target_date)
         if not df_price.empty:
             row = df_price.iloc[0]
             res["price"] = {
                 "close": int(row.get("Close", 0)),
                 "rate": float(row.get("Change", 0.0) * 100),
-                "vol": int(row.get("Volume", 0)), # 명세서상 ACC_TRDVOL 
-                "amt": int(row.get("Amount", 0))  # 명세서상 ACC_TRDVAL 
+                "vol": int(row.get("Volume", 0)), # Spec: ACC_TRDVOL 
+                "amt": int(row.get("Amount", 0))  # Spec: ACC_TRDVAL 
             }
 
-        # pykrx로 투자자별 수급 수집
+        # pykrx 수급 수집
         df_inv = krx.get_market_net_purchases_of_equities_by_ticker(ds, ds, ticker)
         if not df_inv.empty:
             inv = df_inv.iloc[0]
@@ -59,7 +57,7 @@ def get_comprehensive_data(ticker, target_date):
                 "inst": int(inv.get("기관합계", 0))
             }
 
-        # 기술적 지표 연산 (최근 120일 데이터)
+        # 기술적 지표 연산
         start_ds = (target_date - timedelta(days=150)).strftime("%Y-%m-%d")
         df_h = fdr.DataReader(ticker, start_ds, target_date.strftime("%Y-%m-%d"))
         if not df_h.empty:
@@ -69,8 +67,7 @@ def get_comprehensive_data(ticker, target_date):
             rsi = 100 - (100 / (1 + up.ewm(com=13).mean() / down.ewm(com=13).mean())).iloc[-1]
             std = c.rolling(20).std().iloc[-1]
             res["tech"] = {"ma5": int(ma5), "ma20": int(ma20), "rsi": round(rsi, 2), "bb_u": int(ma20 + 2*std), "bb_l": int(ma20 - 2*std)}
-    except:
-        pass
+    except: pass
     return res
 
 # [4] 뉴스 수집
@@ -86,7 +83,7 @@ def fetch_news_list(query):
     except: pass
     return news_items
 
-# [5] 텔레그램 전송
+# [5] 텔레그램 전송 (기존 성공 로직)
 def send_telegram(text: str, json_data: dict):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -101,7 +98,6 @@ def send_telegram(text: str, json_data: dict):
 def main():
     target_ticker = TICKERS["더즌"]
     v_date = find_latest_valid_date(target_ticker)
-    
     main_data = get_comprehensive_data(target_ticker, v_date)
     peer_results = {n: get_comprehensive_data(c, v_date) for n, c in TICKERS.items() if n != "더즌"}
     news_results = {n: fetch_news_list(f"{n} 주가") for n in TICKERS.keys()}
@@ -110,9 +106,7 @@ def main():
     status = "📈" if p['rate'] > 0 else "📉" if p['rate'] < 0 else "➡️"
     
     rsi_val = t.get('rsi', 0)
-    rsi_sig = "중립"
-    if rsi_val > 70: rsi_sig = "과매수"
-    elif rsi_val < 30: rsi_sig = "과매도"
+    rsi_sig = "과매수" if rsi_val > 70 else "과매도" if rsi_val < 30 else "중립"
 
     report = [
         f"📊 *더즌({target_ticker}) 기업분석 리포트* — {v_date.strftime('%Y-%m-%d')}",
@@ -147,7 +141,7 @@ def main():
     os.makedirs("output", exist_ok=True)
     with open(f"output/dozen_{v_date.strftime('%Y%m%d')}.json", "w", encoding="utf-8") as f:
         json.dump(json_out, f, ensure_ascii=False, indent=2)
-    print("✅ 리포트 전송 완료")
+    print("✅ 모든 작업 완료")
 
 if __name__ == "__main__":
     main()
