@@ -1,3 +1,4 @@
+FinanceDataReader
 pykrx
 requests
 beautifulsoup4
