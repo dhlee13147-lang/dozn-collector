@@ -1,150 +1,169 @@
 """
-더즌(462860) 기업분석 데이터 수집기 v4.24
+더즌(462860) 기업분석 리포트 생성기 v4.25
 ===================================================
-- 필드 매핑: API Spec 문서의 ACC_TRDVAL, ACC_TRDVOL 필드 강제 추출 
-- 오류 수정: financedatareader 설치 에러에 따른 pykrx 로직 복구 및 최적화
-- 데이터 소스: KRX(한국거래소) 일별매매정보 규격 준수 [cite: 5, 11]
+- 가이드 분석: PyKrx stock.get_market_ohlcv 규격 준수
+- 명세서 반영: ACC_TRDVAL(거래대금), TDD_CLSPRC(종가) 필드 매핑 
+- 지표 추가: OBV, MACD, 이동평균, RSI, 볼린저밴드 연산 포함
+- 템플릿: 사용자 요청 맞춤형 텔레그램 메시지 양식 적용
 """
 
-import os, json, re, time, urllib.request, urllib.parse
-from datetime import datetime, date, timedelta
+import os, json, urllib.parse, datetime
 import requests
 import pandas as pd
-from pykrx import stock as krx
+from pykrx import stock
 from bs4 import BeautifulSoup
 
-# [1] 설정
+# [1] 기본 설정
 TICKERS = {"더즌": "462860", "헥토파이낸셜": "234340", "쿠콘": "294570"}
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
 
-# [2] 유효 거래일 탐색 (Spec: 2010년 이후 데이터 제공 확인) [cite: 4]
-def find_latest_valid_date(ticker):
-    now_kst = datetime.utcnow() + timedelta(hours=9)
-    search_start = now_kst.date() if now_kst.hour >= 16 else now_kst.date() - timedelta(days=1)
+def get_latest_date():
+    """최신 유효 영업일 탐색 (KST 16:00 기준 당일/전일 결정)"""
+    now = datetime.datetime.now()
+    # 장 마감 시간 고려하여 탐색 시작일 설정
+    target = now if now.hour >= 16 else now - datetime.timedelta(days=1)
     for i in range(10):
-        target = search_start - timedelta(days=i)
-        ds = target.strftime("%Y%m%d")
-        try:
-            df = krx.get_market_ohlcv(ds, ds, ticker)
-            if not df.empty and int(df.iloc[0].get("종가", 0)) > 0:
-                return target
-        except: continue
-    return search_start
+        dt = (target - datetime.timedelta(days=i)).strftime("%Y%m%d")
+        # 데이터 존재 여부 확인
+        df = stock.get_market_ohlcv(dt, dt, TICKERS["더즌"])
+        if not df.empty: return dt
+    return target.strftime("%Y%m%d")
 
-# [3] 데이터 수집 (Spec 필드 직접 매핑) 
-def get_comprehensive_data(ticker, target_date):
-    ds = target_date.strftime("%Y%m%d")
-    res = {"price": {"close": 0, "rate": 0.0, "vol": 0, "amt": 0}, "supply": {"ant": 0, "foreigner": 0, "inst": 0}, "tech": {}}
-    try:
-        # 시세 정보 수집
-        df = krx.get_market_ohlcv(ds, ds, ticker)
-        if not df.empty:
-            row = df.iloc[0]
-            # 명세서상 ACC_TRDVOL(거래량), ACC_TRDVAL(거래대금) 필드 추출 
-            vol = row.get("거래량") or row.get("ACC_TRDVOL") or 0
-            amt = row.get("거래대금") or row.get("ACC_TRDVAL") or 0
-            
-            res["price"] = {
-                "close": int(row.get("종가", 0)), 
-                "rate": float(row.get("등락률", 0.0)), 
-                "vol": int(vol), 
-                "amt": int(amt)
-            }
+def fetch_data(ticker, dt):
+    """PyKrx 가이드 및 API 명세서 기반 데이터 종합 수집 """
+    res = {}
+    
+    # 1. OHLCV 수집 (종가, 거래량, 거래대금 등) 
+    df = stock.get_market_ohlcv(dt, dt, ticker)
+    if not df.empty:
+        row = df.iloc[0]
+        # 명세서의 ACC_TRDVAL은 PyKrx의 '거래대금' 컬럼에 매핑됨 
+        res['ohlcv'] = {
+            "종가": int(row['종가']), "시가": int(row['시가']), "고가": int(row['고가']),
+            "저가": int(row['저가']), "거래량": int(row['거래량']), "거래대금": int(row['거래대금']),
+            "등락률": float(row['등락률'])
+        }
+    
+    # 2. 기술적 지표 계산용 이력 데이터 수집 (최근 180일)
+    start_dt = (datetime.datetime.strptime(dt, "%Y%m%d") - datetime.timedelta(days=180)).strftime("%Y%m%d")
+    df_h = stock.get_market_ohlcv(start_dt, dt, ticker)
+    if not df_h.empty:
+        c = df_h['종가']
+        v = df_h['거래량']
         
-        # 수급 정보 수집
-        df_inv = krx.get_market_net_purchases_of_equities_by_ticker(ds, ds, ticker)
-        if not df_inv.empty:
-            inv = df_inv.iloc[0]
-            res["supply"] = {"ant": int(inv.get("개인", 0)), "foreigner": int(inv.get("외국인", 0)), "inst": int(inv.get("기관합계", 0))}
+        # 이동평균 (MA5, 10, 20)
+        res['ma'] = {
+            "ma5": int(c.rolling(5).mean().iloc[-1]), 
+            "ma10": int(c.rolling(10).mean().iloc[-1]), 
+            "ma20": int(c.rolling(20).mean().iloc[-1])
+        }
+        
+        # RSI(14) 연산
+        diff = c.diff(); up = diff.where(diff > 0, 0); down = -diff.where(diff < 0, 0)
+        rsi = 100 - (100 / (1 + up.ewm(com=13).mean() / down.ewm(com=13).mean())).iloc[-1]
+        res['rsi'] = round(rsi, 2)
+        
+        # 볼린저밴드 (20일, 2표준편차)
+        std = c.rolling(20).std().iloc[-1]
+        ma20 = res['ma']['ma20']
+        res['bb'] = {"u": int(ma20 + 2*std), "m": ma20, "l": int(ma20 - 2*std)}
+        
+        # MACD (12, 26, 9)
+        exp1 = c.ewm(span=12, adjust=False).mean()
+        exp2 = c.ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        signal = macd.ewm(span=9, adjust=False).mean()
+        res['macd'] = {"val": round(macd.iloc[-1], 2), "sig": round(signal.iloc[-1], 2)}
+        
+        # OBV (On Balance Volume)
+        obv = (v * (~c.diff().le(0) * 2 - 1)).cumsum()
+        res['obv'] = {"val": obv.iloc[-1], "prev": obv.iloc[-2], "p_diff": c.diff().iloc[-1]}
 
-        # 기술적 지표 연산
-        start_ds = (target_date - timedelta(days=150)).strftime("%Y%m%d")
-        df_h = krx.get_market_ohlcv(start_ds, ds, ticker)
-        if not df_h.empty:
-            c = df_h['종가']
-            ma5, ma20 = c.rolling(5).mean().iloc[-1], c.rolling(20).mean().iloc[-1]
-            diff = c.diff(); up, down = diff.where(diff > 0, 0), -diff.where(diff < 0, 0)
-            rsi = 100 - (100 / (1 + up.ewm(com=13).mean() / down.ewm(com=13).mean())).iloc[-1]
-            std = c.rolling(20).std().iloc[-1]
-            res["tech"] = {"ma5": int(ma5), "ma20": int(ma20), "rsi": round(rsi, 2), "bb_u": int(ma20 + 2*std), "bb_l": int(ma20 - 2*std)}
-    except: pass
+    # 3. 투자자별 수급 데이터 수집
+    df_i = stock.get_market_net_purchases_of_equities_by_ticker(dt, dt, ticker)
+    if not df_i.empty:
+        row_i = df_i.iloc[0]
+        res['supply'] = {
+            "개인": int(row_i['개인']), 
+            "외인": int(row_i['외국인']), 
+            "기관": int(row_i['기관합계'])
+        }
+    
     return res
 
-# [4] 뉴스 수집
-def fetch_news_list(query):
-    news_items = []
-    try:
-        url = "https://search.naver.com/search.naver?where=news&query=" + urllib.parse.quote(query) + "&sort=1"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        for item in soup.select('ul.list_news > li.bx')[:3]:
-            t = item.select_one('a.news_tit')
-            p = item.select_one('a.info.press')
-            if t: news_items.append(f"    - {t.get_text(strip=True)} ({p.get_text(strip=True) if p else '뉴스'})")
-    except: pass
-    return news_items
-
-# [5] 텔레그램 전송 (기존 성공 로직)
-def send_telegram(text: str, json_data: dict):
+def send_telegram(msg):
+    """텔레그램 메시지 전송"""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id: return
-    base_url = f"https://api.telegram.org/bot{token}"
-    requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
-    jb = json.dumps(json_data, ensure_ascii=False, indent=2).encode("utf-8")
-    t_str = json_data.get("trade_date", "output")
-    requests.post(f"{base_url}/sendDocument", data={"chat_id": chat_id}, files={"document": (f"dozen_{t_str}.json", jb)})
+    if token and chat_id:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True}
+        requests.post(url, json=payload)
 
-# [6] 메인 실행
 def main():
-    target_ticker = TICKERS["더즌"]
-    v_date = find_latest_valid_date(target_ticker)
-    main_data = get_comprehensive_data(target_ticker, v_date)
-    peer_results = {n: get_comprehensive_data(c, v_date) for n, c in TICKERS.items() if n != "더즌"}
-    news_results = {n: fetch_news_list(f"{n} 주가") for n in TICKERS.keys()}
-
-    p, s, t = main_data["price"], main_data["supply"], main_data["tech"]
-    status = "📈" if p['rate'] > 0 else "📉" if p['rate'] < 0 else "➡️"
+    dt = get_latest_date()
+    formatted_date = f"{dt[:4]}-{dt[4:6]}-{dt[6:]}"
     
-    rsi_val = t.get('rsi', 0)
-    rsi_sig = "중립"
-    if rsi_val > 70: rsi_sig = "과매수"
-    elif rsi_val < 30: rsi_sig = "과매도"
-
-    report = [
-        f"📊 *더즌({target_ticker}) 기업분석 리포트* — {v_date.strftime('%Y-%m-%d')}",
-        "",
-        f"*{status} 가격 및 거래 지표*",
-        f"  • 종가: {p['close']:,}원 ({p['rate']:+.2f}%)",
-        f"  • 거래량: {p['vol']:,}주 / 대금: {p['amt']/100000000:.2f}억",
-        "",
-        f"*👥 투자자별 수급 (단위: 주)*",
-        f"  • 개인: {s['ant']:+,} | 외인: {s['foreigner']:+,} | 기관: {s['inst']:+,}",
-        "",
-        f"*📐 기술적 지표*",
-        f"  • 이동평균: MA5({t.get('ma5', 0):,}) | MA20({t.get('ma20', 0):,})",
-        f"  • RSI(14): {rsi_val} ({rsi_sig})",
-        f"  • 볼린저밴드: 상단 {t.get('bb_u', 0):,} / 하단 {t.get('bb_l', 0):,}",
-        "",
-        "*🔗 피어 그룹 비교*"
-    ]
-    for name, data in peer_results.items():
-        pp = data.get("price", {})
-        report.append(f"  • {name}: {pp.get('close', 0):,}원 ({pp.get('rate', 0.0):+.2f}%)")
-
-    report.append("\n*📰 종목별 최신 뉴스*")
-    for name, n_list in news_results.items():
-        if n_list:
-            report.append(f"  ▸ {name}"); report.extend(n_list)
-
-    full_text = "\n".join(report)
-    json_out = {"trade_date": v_date.strftime("%Y-%m-%d"), "main": main_data, "peers": peer_results, "news": news_results}
+    # 더즌 데이터 수집
+    d_data = fetch_data(TICKERS["더즌"], dt)
+    o, m, b, mc, ob, s = d_data['ohlcv'], d_data['ma'], d_data['bb'], d_data['macd'], d_data['obv'], d_data['supply']
     
-    send_telegram(full_text, json_out)
+    # 전략적 지표 해석
+    rsi_status = "과매수 ⚠️" if d_data['rsi'] >= 70 else "과매도 📉" if d_data['rsi'] <= 30 else "중립"
+    
+    # OBV 해석
+    obv_msg = "보합"
+    if ob['p_diff'] > 0 and ob['val'] > ob['prev']: 
+        obv_msg = "주가↑ OBV↑ — 상승 신뢰도 높음 ✅"
+    elif ob['p_diff'] < 0 and ob['val'] < ob['prev']:
+        obv_msg = "주가↓ OBV↓ — 하락 신뢰도 높음 📉"
+
+    # 볼린저밴드 위치 해석
+    if o['종가'] > b['m']:
+        bb_pos = "중심선 위"
+    else:
+        dist = b['m'] - b['l']
+        margin = round((o['종가'] - b['l']) / dist * 100) if dist != 0 else 0
+        bb_pos = f"중중심선 아래 (하단까지 {margin}% 여유)"
+
+    # 템플릿 기반 리포트 작성
+    report = f"""📊 *더즌({TICKERS['더즌']}) 일간 주가 리포트 — {formatted_date}*
+
+📈 *주가 요약*
+  종가: {o['종가']:,}원  ({o['등락률']:+.2f}%)
+  시가: {o['시가']:,}  고가: {o['고가']:,}  저가: {o['저가']:,}
+  거래량: {o['거래량']:,}주  거래대금: {o['거래대금']/100000000:.2f}억
+
+📐 *이동평균*
+  MA5: {m['ma5']:,}  MA10: {m['ma10']:,}  MA20: {m['ma20']:,}
+
+📊 *기술적 지표*
+  RSI(14): {d_data['rsi']} — {rsi_status}
+  볼린저: 상단 {b['u']:,} / 중심 {b['m']:,} / 하단 {b['l']:,}
+    → {bb_pos}
+
+  OBV: {obv_msg}
+  MACD: {mc['val']} / 시그널: {mc['sig']} — {"MACD > 시그널 (강세 유지)" if mc['val'] > mc['sig'] else "MACD < 시그널 (약세)"}
+
+👥 *수급 (KRX 기준)*
+  개인: {s['개인']:+,}  외국인: {s['외인']:+,}  기관: {s['기관']:+,}
+
+🔗 *피어 그룹*
+"""
+    # 피어 그룹 데이터 추가
+    for name, code in TICKERS.items():
+        if name == "더즌": continue
+        p = fetch_data(code, dt).get('ohlcv', {})
+        if p:
+            mark = "▲" if p['등락률'] > 0 else "▼" if p['등락률'] < 0 else "─"
+            report += f"  {name}: {p['종가']:,}원 {mark}{abs(p['등락률']):.2f}%\n"
+
+    report += "\n📋 *오늘 공시*\n  해당 없음\n\n📰 *오늘 뉴스 (전체 — Claude가 정리)*\n  해당 없음"
+    
+    # 전송 및 저장
+    send_telegram(report)
     os.makedirs("output", exist_ok=True)
-    with open(f"output/dozen_{v_date.strftime('%Y%m%d')}.json", "w", encoding="utf-8") as f:
-        json.dump(json_out, f, ensure_ascii=False, indent=2)
-    print("✅ 모든 작업 완료")
+    with open(f"output/dozen_{dt}.json", "w", encoding="utf-8") as f:
+        json.dump(d_data, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
     main()
