@@ -1,17 +1,15 @@
 """
-더즌(462860) 기업분석 데이터 수집기 v4.23
+더즌(462860) 기업분석 데이터 수집기 v4.24
 ===================================================
-- 오류 수정: pip 설치 오류 해결 (financedatareader 소문자 적용)
-- 명세서 반영: ACC_TRDVAL(거래대금), ACC_TRDVOL(거래량) 데이터 매핑 
-- 데이터 소스: FinanceDataReader + pykrx 하이브리드
-- 전송 로직: 기존 성공했던 텔레그램 바이너리 전송 방식 적용
+- 필드 매핑: API Spec 문서의 ACC_TRDVAL, ACC_TRDVOL 필드 강제 추출 
+- 오류 수정: financedatareader 설치 에러에 따른 pykrx 로직 복구 및 최적화
+- 데이터 소스: KRX(한국거래소) 일별매매정보 규격 준수 [cite: 5, 11]
 """
 
 import os, json, re, time, urllib.request, urllib.parse
 from datetime import datetime, date, timedelta
 import requests
 import pandas as pd
-import FinanceDataReader as fdr
 from pykrx import stock as krx
 from bs4 import BeautifulSoup
 
@@ -19,49 +17,51 @@ from bs4 import BeautifulSoup
 TICKERS = {"더즌": "462860", "헥토파이낸셜": "234340", "쿠콘": "294570"}
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
 
-# [2] 유효 거래일 탐색
+# [2] 유효 거래일 탐색 (Spec: 2010년 이후 데이터 제공 확인) [cite: 4]
 def find_latest_valid_date(ticker):
     now_kst = datetime.utcnow() + timedelta(hours=9)
-    end_date = now_kst.date() if now_kst.hour >= 16 else now_kst.date() - timedelta(days=1)
-    start_date = end_date - timedelta(days=10)
-    try:
-        df = fdr.DataReader(ticker, start_date, end_date)
-        if not df.empty:
-            return df.index[-1].to_pydatetime().date()
-    except: pass
-    return end_date
+    search_start = now_kst.date() if now_kst.hour >= 16 else now_kst.date() - timedelta(days=1)
+    for i in range(10):
+        target = search_start - timedelta(days=i)
+        ds = target.strftime("%Y%m%d")
+        try:
+            df = krx.get_market_ohlcv(ds, ds, ticker)
+            if not df.empty and int(df.iloc[0].get("종가", 0)) > 0:
+                return target
+        except: continue
+    return search_start
 
-# [3] 데이터 수집 (명세서 규격 ACC_TRDVAL, ACC_TRDVOL 반영)
+# [3] 데이터 수집 (Spec 필드 직접 매핑) 
 def get_comprehensive_data(ticker, target_date):
     ds = target_date.strftime("%Y%m%d")
     res = {"price": {"close": 0, "rate": 0.0, "vol": 0, "amt": 0}, "supply": {"ant": 0, "foreigner": 0, "inst": 0}, "tech": {}}
     try:
-        # fdr 시세 수집 (거래량: ACC_TRDVOL, 거래대금: ACC_TRDVAL 대응) 
-        df_price = fdr.DataReader(ticker, target_date, target_date)
-        if not df_price.empty:
-            row = df_price.iloc[0]
+        # 시세 정보 수집
+        df = krx.get_market_ohlcv(ds, ds, ticker)
+        if not df.empty:
+            row = df.iloc[0]
+            # 명세서상 ACC_TRDVOL(거래량), ACC_TRDVAL(거래대금) 필드 추출 
+            vol = row.get("거래량") or row.get("ACC_TRDVOL") or 0
+            amt = row.get("거래대금") or row.get("ACC_TRDVAL") or 0
+            
             res["price"] = {
-                "close": int(row.get("Close", 0)),
-                "rate": float(row.get("Change", 0.0) * 100),
-                "vol": int(row.get("Volume", 0)), # Spec: ACC_TRDVOL 
-                "amt": int(row.get("Amount", 0))  # Spec: ACC_TRDVAL 
+                "close": int(row.get("종가", 0)), 
+                "rate": float(row.get("등락률", 0.0)), 
+                "vol": int(vol), 
+                "amt": int(amt)
             }
-
-        # pykrx 수급 수집
+        
+        # 수급 정보 수집
         df_inv = krx.get_market_net_purchases_of_equities_by_ticker(ds, ds, ticker)
         if not df_inv.empty:
             inv = df_inv.iloc[0]
-            res["supply"] = {
-                "ant": int(inv.get("개인", 0)),
-                "foreigner": int(inv.get("외국인", 0)),
-                "inst": int(inv.get("기관합계", 0))
-            }
+            res["supply"] = {"ant": int(inv.get("개인", 0)), "foreigner": int(inv.get("외국인", 0)), "inst": int(inv.get("기관합계", 0))}
 
         # 기술적 지표 연산
-        start_ds = (target_date - timedelta(days=150)).strftime("%Y-%m-%d")
-        df_h = fdr.DataReader(ticker, start_ds, target_date.strftime("%Y-%m-%d"))
+        start_ds = (target_date - timedelta(days=150)).strftime("%Y%m%d")
+        df_h = krx.get_market_ohlcv(start_ds, ds, ticker)
         if not df_h.empty:
-            c = df_h['Close']
+            c = df_h['종가']
             ma5, ma20 = c.rolling(5).mean().iloc[-1], c.rolling(20).mean().iloc[-1]
             diff = c.diff(); up, down = diff.where(diff > 0, 0), -diff.where(diff < 0, 0)
             rsi = 100 - (100 / (1 + up.ewm(com=13).mean() / down.ewm(com=13).mean())).iloc[-1]
@@ -74,11 +74,12 @@ def get_comprehensive_data(ticker, target_date):
 def fetch_news_list(query):
     news_items = []
     try:
-        url = f"https://search.naver.com/search.naver?where=news&query={urllib.parse.quote(query)}&sort=1"
+        url = "https://search.naver.com/search.naver?where=news&query=" + urllib.parse.quote(query) + "&sort=1"
         resp = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(resp.text, 'html.parser')
         for item in soup.select('ul.list_news > li.bx')[:3]:
-            t, p = item.select_one('a.news_tit'), item.select_one('a.info.press')
+            t = item.select_one('a.news_tit')
+            p = item.select_one('a.info.press')
             if t: news_items.append(f"    - {t.get_text(strip=True)} ({p.get_text(strip=True) if p else '뉴스'})")
     except: pass
     return news_items
@@ -106,7 +107,9 @@ def main():
     status = "📈" if p['rate'] > 0 else "📉" if p['rate'] < 0 else "➡️"
     
     rsi_val = t.get('rsi', 0)
-    rsi_sig = "과매수" if rsi_val > 70 else "과매도" if rsi_val < 30 else "중립"
+    rsi_sig = "중립"
+    if rsi_val > 70: rsi_sig = "과매수"
+    elif rsi_val < 30: rsi_sig = "과매도"
 
     report = [
         f"📊 *더즌({target_ticker}) 기업분석 리포트* — {v_date.strftime('%Y-%m-%d')}",
