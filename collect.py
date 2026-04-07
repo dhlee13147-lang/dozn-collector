@@ -1,9 +1,9 @@
 """
-더즌(462860) 기업분석 데이터 수집기 v4.15
+더즌(462860) 기업분석 데이터 수집기 v4.16
 ===================================================
-- 명세서 반영: ACC_TRDVAL(거래대금), ACC_TRDVOL(거래량) 필드 표준화 
-- 수급 보강: KRX 일별매매정보 규격을 바탕으로 투자자별 데이터 매핑 
-- 안정성: 텔레그램 바이너리 전송 및 날짜 역추적 로직 통합
+- 오류 수정: ValueError (천 단위 구분 기호와 공백 충돌) 해결
+- 명세서 반영: ACC_TRDVAL(거래대금), ACC_TRDVOL(거래량) 데이터 매핑 
+- 분석 지표: 이동평균, RSI, 볼린저밴드 연산 (Pandas 기반)
 """
 
 import os, json, re, time, urllib.request, urllib.parse
@@ -20,7 +20,7 @@ HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9",
 }
 
-# [2] 유효 거래일 탐색 (명세서상 2010년 이후 데이터 제공 확인 )
+# [2] 유효 거래일 탐색 (명세서상 2010년 데이터부터 제공 확인) [cite: 4]
 def find_latest_valid_date(ticker):
     now_kst = datetime.utcnow() + timedelta(hours=9)
     search_start = now_kst.date() if now_kst.hour >= 16 else now_kst.date() - timedelta(days=1)
@@ -35,18 +35,18 @@ def find_latest_valid_date(ticker):
         except: continue
     return None
 
-# [3] 데이터 수집 (API 명세서 필드명 적용 )
+# [3] 데이터 수집 (명세서 규격 적용) 
 def get_comprehensive_data(ticker, target_date):
     if not target_date: return {}
     ds = target_date.strftime("%Y%m%d")
     res = {"price": {"close": 0, "rate": 0.0, "vol": 0, "amt": 0}, "supply": {"ant": 0, "foreigner": 0, "inst": 0}, "tech": {}}
     
     try:
-        # 시세 정보 (명세서 필드명 대응: ACC_TRDVOL, ACC_TRDVAL )
+        # 시세 정보 (명세서 필드명 대응: ACC_TRDVOL, ACC_TRDVAL) 
         df = krx.get_market_ohlcv(ds, ds, ticker)
         if not df.empty:
             row = df.iloc[0]
-            # 명세서상 거래량은 ACC_TRDVOL, 거래대금은 ACC_TRDVAL 
+            # 거래량은 ACC_TRDVOL, 거래대금은 ACC_TRDVAL 
             vol = row.get("거래량") or row.get("ACC_TRDVOL") or 0
             amt = row.get("거래대금") or row.get("ACC_TRDVAL") or 0
             
@@ -57,7 +57,7 @@ def get_comprehensive_data(ticker, target_date):
                 "amt": int(amt)
             }
         
-        # 수급 정보 (투자자별 순매수량)
+        # 수급 정보 (투자자별 순매수)
         df_inv = krx.get_market_net_purchases_of_equities_by_ticker(ds, ds, ticker)
         if not df_inv.empty:
             inv = df_inv.iloc[0]
@@ -93,15 +93,17 @@ def fetch_news_list(query):
     except: pass
     return news_items
 
-# [5] 텔레그램 전송 로직 (기존 성공 방식 유지)
+# [5] 텔레그램 전송
 def send_telegram(text: str, json_data: dict):
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id: return
 
     base_url = f"https://api.telegram.org/bot{token}"
+    # 메시지 전송
     requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
 
+    # JSON 파일 전송
     jb = json.dumps(json_data, ensure_ascii=False, indent=2).encode("utf-8")
     t_str = json_data.get("trade_date", datetime.now().strftime("%Y%m%d"))
     requests.post(f"{base_url}/sendDocument", data={"chat_id": chat_id, "caption": f"📎 데이터 파일 — {t_str}"}, files={"document": (f"dozen_{t_str}.json", jb, "application/json")})
@@ -119,6 +121,7 @@ def main():
     p, s, t = main_data["price"], main_data["supply"], main_data["tech"]
     status = "📈" if p['rate'] > 0 else "📉" if p['rate'] < 0 else "➡️"
     
+    # 리포트 본문 구성
     report = [
         f"📊 *더즌({target_ticker}) 기업분석 리포트* — {v_date.strftime('%Y-%m-%d')}",
         "",
@@ -136,9 +139,13 @@ def main():
         "",
         "*🔗 피어 그룹 비교*"
     ]
+    
+    # 피어 그룹 리스트 추가 (오류 수정 지점)
     for name, data in peer_results.items():
         pp = data.get("price", {})
-        report.append(f"  • {name}: {pp.get('close', 0):, }원 ({pp.get('rate', 0.0):+.2f}%)")
+        price_val = pp.get("close", 0)
+        rate_val = pp.get("rate", 0.0)
+        report.append(f"  • {name}: {price_val:,}원 ({rate_val:+.2f}%)")
 
     report.append("\n*📰 종목별 최신 뉴스*")
     for name, n_list in news_results.items():
