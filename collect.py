@@ -374,25 +374,34 @@ def fetch_peer(ticker: str) -> dict:
 # ─────────────────────────────────────────
 def fetch_history(ticker: str, days: int = 60) -> list:
     """최근 60거래일 OHLCV 이력 (MA/RSI/BB/OBV/MACD 계산용)
-    pykrx는 이 목적으로만 사용
+
+    pykrx는 이 목적으로만 사용.
+    오늘 날짜 행은 명시적으로 제거:
+      - pykrx가 오늘 데이터를 포함할 수도 있고 아닐 수도 있어 불확실
+      - 오늘 데이터는 반드시 today_record(네이버 main 기준)로만 추가
+      - 이 함수는 전일까지의 확정 이력만 반환
     """
-    today = date.today()
-    start = today - timedelta(days=days * 2)
+    today     = date.today()
+    today_str = today.isoformat()          # "2026-04-08"
+    start     = today - timedelta(days=days * 2)
     try:
         df = krx.get_market_ohlcv(strdate(start), strdate(today), ticker)
         if df.empty:
             return []
         records = []
         for dt, row in df.iterrows():
+            dt_str = dt.strftime("%Y-%m-%d")
+            if dt_str == today_str:        # 오늘 날짜는 제외
+                continue
             records.append({
-                "날짜":   dt.strftime("%Y-%m-%d"),
+                "날짜":   dt_str,
                 "시가":   int(row.get("시가", 0)),
                 "고가":   int(row.get("고가", 0)),
                 "저가":   int(row.get("저가", 0)),
                 "종가":   int(row.get("종가", 0)),
                 "거래량": int(row.get("거래량", 0)),
             })
-        return records[-days:]
+        return records[-days:]             # 전일까지 최대 60일
     except Exception as e:
         print(f"    [ERROR] 이력: {e}")
         return []
@@ -423,9 +432,15 @@ def calc_technical_indicators(history: list) -> dict:
 
     if len(closes) >= 15:
         deltas = [closes[i]-closes[i-1] for i in range(1, len(closes))]
-        ag = sum(max(d,0) for d in deltas[-14:]) / 14
-        al = sum(abs(min(d,0)) for d in deltas[-14:]) / 14
-        rsi = 100.0 if al == 0 else round(100 - 100/(1+ag/al), 2)
+        gains  = [max(d, 0)       for d in deltas]
+        losses = [abs(min(d, 0))  for d in deltas]
+        # Wilder 방식 (HTS 표준): 최초 14일 단순평균 → 이후 지수평활
+        avg_g = sum(gains[:14])  / 14
+        avg_l = sum(losses[:14]) / 14
+        for i in range(14, len(gains)):
+            avg_g = (avg_g * 13 + gains[i])  / 14
+            avg_l = (avg_l * 13 + losses[i]) / 14
+        rsi = 100.0 if avg_l == 0 else round(100 - 100/(1+avg_g/avg_l), 2)
         result["RSI14"] = rsi
         result["RSI14_signal"] = (
             "과매수 ⚠️" if rsi >= 70 else
@@ -721,17 +736,23 @@ def collect_all() -> dict:
     # 오늘 데이터를 이력에 추가/교체 → 항상 61일 기준
     today_close = main_data.get("종가", 0) or frgn["종가"]
     today_record = {
-        "날짜":   trade_date,
+        "날짜":   trade_date,   # 항상 오늘 날짜
         "시가":   main_data.get("시가",  today_close),
         "고가":   main_data.get("고가",  today_close),
         "저가":   main_data.get("저가",  today_close),
         "종가":   today_close,
-        "거래량": frgn["거래량"],
+        "거래량": main_data.get("거래량", frgn["거래량"]),
     }
-    if history and history[-1]["날짜"] == trade_date:
-        history[-1] = today_record   # pykrx가 오늘 데이터를 가져왔으면 교체
+    if history:
+        last_date = history[-1]["날짜"]
+        if last_date == trade_date:
+            # pykrx가 이미 오늘 데이터를 포함 → 교체 (중복 방지)
+            history[-1] = today_record
+        else:
+            # pykrx 이력이 어제까지만 있음 → 오늘 데이터 추가
+            history.append(today_record)
     else:
-        history.append(today_record) # 없으면 추가
+        history.append(today_record)
 
     indicators = calc_technical_indicators(history)
     result["이동평균"] = {**indicators, "history_60d": history}
