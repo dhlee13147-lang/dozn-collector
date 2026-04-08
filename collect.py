@@ -588,52 +588,43 @@ def collect_all() -> dict:
         "뉴스": {},
     }
 
-    # ── Step 2: 시장요약에서 거래대금·시가총액·PER·PBR ──
+    # ── Step 2: 네이버 main — 시가/고가/저가/등락률/거래대금 ──
+    print("  ▶ 시가·고가·저가·등락률·거래대금 (네이버 main)...")
+    main_data = fetch_naver_main(t)
+    result["주가"]["시가"]   = main_data.get("시가",   0)
+    result["주가"]["고가"]   = main_data.get("고가",   0)
+    result["주가"]["저가"]   = main_data.get("저가",   0)
+    result["주가"]["등락률"] = main_data.get("등락률", 0.0)
+
+    # ── Step 3: 시장요약 — 거래대금·시가총액·PER·PBR ──────
     print("  ▶ 시장요약 (거래대금·시총·PER·PBR)...")
     market = fetch_naver_market_sum(t)
+    # 거래대금: main 값 우선, 없으면 시장요약 값
+    result["주가"]["거래대금"]     = main_data.get("거래대금", 0) or market.get("거래대금", 0)
     result["기본정보"]["시가총액"] = market.get("시가총액", 0)
-    result["기본정보"]["PER"]     = market.get("PER", "-")
-    result["기본정보"]["PBR"]     = market.get("PBR", "-")
+    result["기본정보"]["PER"]      = market.get("PER", "-")
+    result["기본정보"]["PBR"]      = market.get("PBR", "-")
 
-    # ── Step 3: 기술적 지표 (pykrx 60일 + 오늘 = 61일) ──
+    # ── Step 4: 기술적 지표 (pykrx 60일 + 오늘 = 61일) ──
     print("  ▶ 기술적 지표 계산 (pykrx 60일 + 오늘 보완)...")
-    history    = fetch_history(t, days=60)
-    # 오늘 데이터를 이력에 추가 (네이버 main 기준으로 보완 → 61일)
-    # pykrx 이력 마지막 날짜가 오늘이면 덮어쓰고, 아니면 추가
-    if history and frgn:
-        today_record = {
-            "날짜":   frgn["날짜"],
-            "시가":   main_data.get("시가",   frgn.get("종가", 0)),
-            "고가":   main_data.get("고가",   frgn.get("종가", 0)),
-            "저가":   main_data.get("저가",   frgn.get("종가", 0)),
-            "종가":   frgn["종가"],
-            "거래량": frgn["거래량"],
-        }
-        # 마지막 행이 같은 날짜면 교체, 다른 날짜면 추가
-        if history[-1]["날짜"] == frgn["날짜"]:
-            history[-1] = today_record
-        else:
-            history.append(today_record)
+    history = fetch_history(t, days=60)
+    # 오늘 데이터를 이력에 추가/교체 → 항상 61일 기준
+    today_record = {
+        "날짜":   frgn["날짜"],
+        "시가":   main_data.get("시가",  frgn["종가"]),
+        "고가":   main_data.get("고가",  frgn["종가"]),
+        "저가":   main_data.get("저가",  frgn["종가"]),
+        "종가":   frgn["종가"],
+        "거래량": frgn["거래량"],
+    }
+    if history and history[-1]["날짜"] == frgn["날짜"]:
+        history[-1] = today_record   # pykrx가 오늘 데이터를 가져왔으면 교체
+    else:
+        history.append(today_record) # 없으면 추가
 
     indicators = calc_technical_indicators(history)
     result["이동평균"] = {**indicators, "history_60d": history}
-
     print(f"    MA5={indicators.get('MA5','?'):,} RSI={indicators.get('RSI14','?')} (이력 {len(history)}일)")
-
-    # ── Step 4: 시가/고가/저가/등락률 (네이버 main) ────
-    # pykrx 이력 마지막 행 대신 네이버 main에서 직접 가져옴
-    # → frgn 날짜와 동일한 기준 보장
-    print("  ▶ 시가·고가·저가·등락률 (네이버 main)...")
-    main_data = fetch_naver_main(t)
-    result["주가"]["시가"]      = main_data.get("시가",      0)
-    result["주가"]["고가"]      = main_data.get("고가",      0)
-    result["주가"]["저가"]      = main_data.get("저가",      0)
-    result["주가"]["등락률"]    = main_data.get("등락률",    0.0)
-    # 거래대금: main에서 가져온 값 우선, 없으면 시장요약 값 사용
-    if main_data.get("거래대금", 0) > 0:
-        result["주가"]["거래대금"] = main_data["거래대금"]
-    else:
-        result["주가"]["거래대금"] = market.get("거래대금", 0)
 
     # ── Step 5: 피어 (frgn) ─────────────────────────────
     for name, pt in [("헥토파이낸셜", TICKERS["헥토파이낸셜"]),
