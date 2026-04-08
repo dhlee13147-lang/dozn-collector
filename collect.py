@@ -665,12 +665,14 @@ def collect_all() -> dict:
         print("  [ERROR] frgn 수집 실패 — 수집 중단")
         return {}
 
-    trade_date = frgn["날짜"]   # 네이버 기준 최신 거래일 (휴장일이면 전 거래일)
-    print(f"  기준 거래일: {trade_date}")
+    supply_date = frgn["날짜"]          # 수급 데이터 기준일 (frgn 첫 행)
+    trade_date  = date.today().isoformat()  # 리포트 기준일 = 항상 오늘
+    print(f"  리포트 기준일: {trade_date} | 수급 기준일: {supply_date}")
 
     result = {
         "_collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "_trade_date":   trade_date,
+        "_trade_date":   trade_date,    # 항상 오늘 날짜
+        "_supply_date":  supply_date,   # frgn 기준 수급 날짜 (별도 표기)
         "_report_type":  "daily",
         "주가": {
             "종가":   frgn["종가"],   # main_data 수집 후 덮어씀
@@ -719,14 +721,14 @@ def collect_all() -> dict:
     # 오늘 데이터를 이력에 추가/교체 → 항상 61일 기준
     today_close = main_data.get("종가", 0) or frgn["종가"]
     today_record = {
-        "날짜":   frgn["날짜"],
+        "날짜":   supply_date,
         "시가":   main_data.get("시가",  today_close),
         "고가":   main_data.get("고가",  today_close),
         "저가":   main_data.get("저가",  today_close),
         "종가":   today_close,
         "거래량": frgn["거래량"],
     }
-    if history and history[-1]["날짜"] == frgn["날짜"]:
+    if history and history[-1]["날짜"] == supply_date:
         history[-1] = today_record   # pykrx가 오늘 데이터를 가져왔으면 교체
     else:
         history.append(today_record) # 없으면 추가
@@ -817,7 +819,8 @@ def format_telegram(data: dict) -> str:
         f"  MACD: {ma.get('MACD','-')} / 시그널: {ma.get('MACD_signal','-')} — {ma.get('MACD_cross','')}",
         "",
         "*👥 수급*",
-        f"  기관: {s.get('기관',0):+,}  외국인: {s.get('외국인',0):+,}  개인: {s.get('개인',0):+,} *(개인 추정)*",
+        f"  기준일: {data.get('_supply_date', d)}",
+        f"  기관: {s.get('기관',0):+,}  외국인: {s.get('외국인',0):+,}  개인: {s.get('개인',0):+,} (개인 추정)",
         "",
         "*🏢 기본정보*",
         f"  시가총액: {cap_str}  PER: {info.get('PER','-')}  PBR: {info.get('PBR','-')}",
