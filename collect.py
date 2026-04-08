@@ -721,7 +721,7 @@ def collect_all() -> dict:
     # 오늘 데이터를 이력에 추가/교체 → 항상 61일 기준
     today_close = main_data.get("종가", 0) or frgn["종가"]
     today_record = {
-        "날짜":   supply_date,
+        "날짜":   trade_date,
         "시가":   main_data.get("시가",  today_close),
         "고가":   main_data.get("고가",  today_close),
         "저가":   main_data.get("저가",  today_close),
