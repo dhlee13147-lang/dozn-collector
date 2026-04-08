@@ -140,50 +140,108 @@ def fetch_frgn(ticker: str) -> dict:
 # ─────────────────────────────────────────
 # 2. 네이버 main — 시가/고가/저가/등락률 (오늘 기준)
 # ─────────────────────────────────────────
+def parse_num_spans(em_tag) -> int:
+    """네이버 금융 숫자 파싱
+    숫자가 <span class="no숫자">1</span><span class="shim">,</span>... 형태로 분리됨
+    shim(쉼표), 소수점(jum) 제외하고 숫자만 조합
+    """
+    if not em_tag:
+        return 0
+    parts = []
+    for span in em_tag.find_all("span"):
+        cls = span.get("class", [])
+        cls_str = " ".join(cls) if isinstance(cls, list) else cls
+        if "shim" in cls_str:   # 쉼표 구분자 → 스킵
+            continue
+        if "jum" in cls_str:    # 소수점 → 스킵 (정수만 필요)
+            break
+        if any(c.startswith("no") for c in (cls if isinstance(cls, list) else [cls])):
+            parts.append(span.get_text(strip=True))
+    try:
+        return int("".join(parts))
+    except:
+        return 0
+
+
 def fetch_naver_main(ticker: str) -> dict:
-    """네이버 금융 메인 페이지에서 시가/고가/저가/등락률 수집
-    
-    pykrx 이력의 마지막 행을 쓰지 않고 여기서 직접 가져옴
-    → frgn 날짜와 동일한 기준(오늘/최신 거래일)
+    """네이버 금융 메인 페이지에서 시가/고가/저가/거래대금/등락률 수집
+
+    HTML 구조 (첨부 자료 확인):
+      종가:    div.today > p.no_today > em.no_up/no_dn > span.no숫자
+      등락률:  p.no_exday 두 번째 em > span들 (소수점 앞까지)
+      시가:    sp_txt3 다음 em > span.no숫자
+      고가:    sp_txt4 다음 em > span.no숫자
+      저가:    sp_txt5 다음 em > span.no숫자
+      거래대금: sp_txt10 다음 em > span.no숫자 (백만원 단위)
+
+    pykrx가 아닌 네이버 기준 → frgn 날짜와 일치 보장
     """
     url = f"https://finance.naver.com/item/main.naver?code={ticker}"
+    result = {}
     try:
         resp = requests.get(url, headers=HEADERS, timeout=10)
         resp.encoding = "euc-kr"
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        result = {}
-        # _nowVal = 현재가(종가), open/high/low는 구분자로 파싱
-        for label, key in [("시가", "시가"), ("고가", "고가"), ("저가", "저가")]:
-            tag = soup.find("span", id=f"_{label}")
-            if not tag:
-                # 텍스트 기반 fallback
-                th = soup.find("em", string=label)
-                if th:
-                    tag = th.find_next("span")
-            if tag:
-                val = tag.get_text(strip=True).replace(",", "")
+        # ── 시가/고가/저가/거래대금: sp_txtN span 기준 ──────────
+        label_map = {
+            "sp_txt3":  ("시가",    False),   # (key, is_amount)
+            "sp_txt4":  ("고가",    False),
+            "sp_txt5":  ("저가",    False),
+            "sp_txt10": ("거래대금_백만", True),
+        }
+        for cls, (key, is_amt) in label_map.items():
+            span = soup.find("span", class_=cls)
+            if not span:
+                continue
+            # 같은 td 안의 em 태그에서 숫자 추출
+            td = span.find_parent("td") or span.find_parent("p")
+            if not td:
+                continue
+            em = td.find("em")
+            val = parse_num_spans(em)
+            if val > 0:
+                result[key] = val
+
+        # 거래대금: 백만원 → 원 단위 변환
+        if "거래대금_백만" in result:
+            result["거래대금"] = result.pop("거래대금_백만") * 1_000_000
+
+        # ── 등락률: p.no_exday 두 번째 em ─────────────────────
+        no_exday = soup.find("p", class_="no_exday")
+        if no_exday:
+            ems = no_exday.find_all("em")
+            if len(ems) >= 2:
+                rate_em = ems[1]  # 첫 번째=전일대비, 두 번째=등락률
+                # 소수점 포함 파싱
+                parts = []
+                dot = False
+                for span in rate_em.find_all("span"):
+                    cls = " ".join(span.get("class", []))
+                    if "per" in cls or "ico" in cls or "blind" in cls:
+                        continue
+                    if "jum" in cls:
+                        dot = True
+                        parts.append(".")
+                        continue
+                    if any(c.startswith("no") for c in span.get("class", [])):
+                        parts.append(span.get_text(strip=True))
                 try:
-                    result[key] = int(val)
+                    rate_str = "".join(parts)
+                    # 상승/하락 판단
+                    if "no_dn" in rate_em.get("class", []) or "nv01" in str(rate_em):
+                        result["등락률"] = -float(rate_str)
+                    else:
+                        result["등락률"] = float(rate_str)
                 except:
                     pass
 
-        # 등락률
-        rate = soup.find("span", id="_change_rate")
-        if not rate:
-            rate = soup.find("span", class_=lambda c: c and "change_rate" in c)
-        if rate:
-            try:
-                result["등락률"] = float(rate.get_text(strip=True)
-                                        .replace("%","").replace("+","").replace(",",""))
-            except:
-                pass
-
         if result:
             print(f"    main: 시가={result.get('시가',0):,} 고가={result.get('고가',0):,} "
-                  f"저가={result.get('저가',0):,} 등락률={result.get('등락률',0):.2f}%")
+                  f"저가={result.get('저가',0):,} 거래대금={result.get('거래대금',0)//100_000_000:.1f}억 "
+                  f"등락률={result.get('등락률',0):+.2f}%")
         else:
-            print("    [WARN] main 파싱 실패 — 구조 변경 가능성")
+            print("    [WARN] main 파싱 실패")
         return result
 
     except Exception as e:
@@ -533,28 +591,49 @@ def collect_all() -> dict:
     # ── Step 2: 시장요약에서 거래대금·시가총액·PER·PBR ──
     print("  ▶ 시장요약 (거래대금·시총·PER·PBR)...")
     market = fetch_naver_market_sum(t)
-    result["주가"]["거래대금"]    = market.get("거래대금", 0)
     result["기본정보"]["시가총액"] = market.get("시가총액", 0)
     result["기본정보"]["PER"]     = market.get("PER", "-")
     result["기본정보"]["PBR"]     = market.get("PBR", "-")
 
-    # ── Step 3: 기술적 지표 (pykrx 이력 계산) ──────────
-    print("  ▶ 기술적 지표 계산 (pykrx 60일 이력)...")
+    # ── Step 3: 기술적 지표 (pykrx 60일 + 오늘 = 61일) ──
+    print("  ▶ 기술적 지표 계산 (pykrx 60일 + 오늘 보완)...")
     history    = fetch_history(t, days=60)
+    # 오늘 데이터를 이력에 추가 (네이버 main 기준으로 보완 → 61일)
+    # pykrx 이력 마지막 날짜가 오늘이면 덮어쓰고, 아니면 추가
+    if history and frgn:
+        today_record = {
+            "날짜":   frgn["날짜"],
+            "시가":   main_data.get("시가",   frgn.get("종가", 0)),
+            "고가":   main_data.get("고가",   frgn.get("종가", 0)),
+            "저가":   main_data.get("저가",   frgn.get("종가", 0)),
+            "종가":   frgn["종가"],
+            "거래량": frgn["거래량"],
+        }
+        # 마지막 행이 같은 날짜면 교체, 다른 날짜면 추가
+        if history[-1]["날짜"] == frgn["날짜"]:
+            history[-1] = today_record
+        else:
+            history.append(today_record)
+
     indicators = calc_technical_indicators(history)
     result["이동평균"] = {**indicators, "history_60d": history}
 
-    print(f"    MA5={indicators.get('MA5','?'):,} RSI={indicators.get('RSI14','?')}")
+    print(f"    MA5={indicators.get('MA5','?'):,} RSI={indicators.get('RSI14','?')} (이력 {len(history)}일)")
 
     # ── Step 4: 시가/고가/저가/등락률 (네이버 main) ────
     # pykrx 이력 마지막 행 대신 네이버 main에서 직접 가져옴
     # → frgn 날짜와 동일한 기준 보장
     print("  ▶ 시가·고가·저가·등락률 (네이버 main)...")
     main_data = fetch_naver_main(t)
-    result["주가"]["시가"]   = main_data.get("시가",   0)
-    result["주가"]["고가"]   = main_data.get("고가",   0)
-    result["주가"]["저가"]   = main_data.get("저가",   0)
-    result["주가"]["등락률"] = main_data.get("등락률", 0.0)
+    result["주가"]["시가"]      = main_data.get("시가",      0)
+    result["주가"]["고가"]      = main_data.get("고가",      0)
+    result["주가"]["저가"]      = main_data.get("저가",      0)
+    result["주가"]["등락률"]    = main_data.get("등락률",    0.0)
+    # 거래대금: main에서 가져온 값 우선, 없으면 시장요약 값 사용
+    if main_data.get("거래대금", 0) > 0:
+        result["주가"]["거래대금"] = main_data["거래대금"]
+    else:
+        result["주가"]["거래대금"] = market.get("거래대금", 0)
 
     # ── Step 5: 피어 (frgn) ─────────────────────────────
     for name, pt in [("헥토파이낸셜", TICKERS["헥토파이낸셜"]),
