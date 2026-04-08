@@ -764,8 +764,8 @@ def collect_all() -> dict:
 
     # ── Step 5: 피어 (frgn) ─────────────────────────────
     for name, pt in [("헥토파이낸셜", TICKERS["헥토파이낸셜"]),
-                     ("쿠콘",        TICKERS["쿠콘"])],
-                     ("이노스페이스", TICKERS["이노스페이스"])] :
+                 ("쿠콘",         TICKERS["쿠콘"]),
+                 ("이노스페이스", TICKERS["이노스페이스"])]:
         print(f"  ▶ {name} (frgn)...")
         p = fetch_peer(pt)
         result["피어"][name] = {
