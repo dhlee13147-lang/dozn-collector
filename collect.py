@@ -1,3 +1,23 @@
+"""
+더즌(462860) 일간 주가 데이터 수집기 v7
+=========================================
+데이터 소스 및 날짜 기준:
+  모든 당일 데이터는 네이버 금융 크롤링 → 항상 현재 날짜 기준
+  기술적 지표(MA/RSI/BB/OBV/MACD)만 pykrx 이력 계산
+
+  frgn 페이지  → 날짜 확정 + OHLCV + 기관/외국인 순매매량
+  시장요약 페이지 → 거래대금 + 시가총액 + PER + PBR
+
+  날짜 결정 로직:
+    frgn 페이지 첫 번째 행의 날짜 = 오늘 기준 최신 거래일
+    (휴장일이면 자동으로 직전 거래일이 첫 번째 행에 표시됨)
+
+환경변수 (GitHub Secrets):
+  TELEGRAM_BOT_TOKEN
+  TELEGRAM_CHAT_ID
+  DART_API_KEY
+"""
+
 import os, json, re, time, urllib.request, urllib.parse
 from datetime import datetime, date, timedelta
 import requests
@@ -147,11 +167,11 @@ def fetch_naver_main(ticker: str) -> dict:
     """네이버 금융 메인 페이지에서 시가/고가/저가/거래대금/등락률 수집
 
     HTML 구조 (첨부 자료 확인):
-      종가:     div.today > p.no_today > em.no_up/no_dn > span.no숫자
+      종가:    div.today > p.no_today > em.no_up/no_dn > span.no숫자
       등락률:  p.no_exday 두 번째 em > span들 (소수점 앞까지)
-      시가:     sp_txt3 다음 em > span.no숫자
-      고가:     sp_txt4 다음 em > span.no숫자
-      저가:     sp_txt5 다음 em > span.no숫자
+      시가:    sp_txt3 다음 em > span.no숫자
+      고가:    sp_txt4 다음 em > span.no숫자
+      저가:    sp_txt5 다음 em > span.no숫자
       거래대금: sp_txt10 다음 em > span.no숫자 (백만원 단위)
 
     pykrx가 아닌 네이버 기준 → frgn 날짜와 일치 보장
@@ -176,6 +196,7 @@ def fetch_naver_main(ticker: str) -> dict:
             "sp_txt3":  "시가",
             "sp_txt4":  "고가",
             "sp_txt5":  "저가",
+            "sp_txt9":  "거래량",
             "sp_txt10": "거래대금_백만",
         }
         for cls, key in label_map.items():
@@ -223,6 +244,7 @@ def fetch_naver_main(ticker: str) -> dict:
         if result:
             print(f"    main: 종가={result.get('종가',0):,} 시가={result.get('시가',0):,} "
                   f"고가={result.get('고가',0):,} 저가={result.get('저가',0):,} "
+                  f"거래량={result.get('거래량',0):,} "
                   f"거래대금={result.get('거래대금',0)//100_000_000:.1f}억 "
                   f"등락률={result.get('등락률',0):+.2f}%")
         else:
@@ -499,7 +521,6 @@ def fetch_news_from_github_csv(
     repo: str,
     csv_path: str = "sent_news.csv",
     keywords: list = None,
-    target_date: str = None, # 인자 추가
 ) -> dict:
     """GitHub 저장소의 sent_news.csv에서 오늘 날짜 기사만 수집
 
@@ -517,8 +538,7 @@ def fetch_news_from_github_csv(
     if keywords is None:
         keywords = ["더즌", "dozn", "헥토파이낸셜", "쿠콘"]
 
-    # target_date가 들어오면 그 날짜를 쓰고, 없으면 오늘 날짜를 씀
-    today_str = target_date if target_date else date.today().isoformat()
+    today_str = date.today().isoformat()  # "YYYY-MM-DD"
     result = {kw: [] for kw in keywords}
     result["기타"] = []   # 키워드 미매칭 기사도 포함 → Claude 스킬이 정리
 
@@ -535,20 +555,32 @@ def fetch_news_from_github_csv(
         skipped_date = 0
         skipped_press = 0
 
+        import re as _re
+        date_pat = _re.compile(r'^20\d\d-\d{2}-\d{2}$')
+
         for row in reader:
-            # 날짜 컬럼 없는 행 제외
+            if not row:
+                continue
+
+            # 날짜는 항상 마지막 컬럼 (제목에 쉼표가 포함될 수 있어 col[2] 고정 불가)
+            # row[-1]이 날짜 형식인지 확인
             if len(row) < 3:
                 skipped_date += 1
                 continue
 
-            url_val  = row[0].strip()
-            title    = row[1].strip()
-            row_date = row[2].strip()
+            row_date = row[-1].strip()
+            if not date_pat.match(row_date):
+                skipped_date += 1
+                continue
 
             # 날짜 불일치 제외
             if row_date != today_str:
                 skipped_date += 1
                 continue
+
+            url_val = row[0].strip()
+            # 제목: url과 날짜 사이의 모든 컬럼을 합산 (쉼표 포함 제목 대응)
+            title   = ",".join(row[1:-1]).strip().strip('"')
 
             # 언론사 페이지 행 제외 (media.naver.com 또는 도메인만 있는 행)
             is_press = (
@@ -626,9 +658,6 @@ def collect_all() -> dict:
     t = TICKERS["더즌"]
     dart_key = os.getenv("DART_API_KEY", "")
 
-    # 리포트 전체 기준일은 실행 시점(오늘)으로 확정
-    report_today = date.today().isoformat()
-
     # ── Step 1: frgn에서 날짜·OHLCV·수급 ──────────────
     print("  ▶ frgn (날짜 확정 + OHLCV + 수급)...")
     frgn = fetch_frgn(t)
@@ -636,13 +665,12 @@ def collect_all() -> dict:
         print("  [ERROR] frgn 수집 실패 — 수집 중단")
         return {}
 
-    supply_date = frgn["날짜"]   # 네이버 기준 최신 거래일 (휴장일이면 전 거래일)
-    print(f"  리포트 기준일: {report_today} | 수급 데이터 기준일: {supply_date}")
+    trade_date = frgn["날짜"]   # 네이버 기준 최신 거래일 (휴장일이면 전 거래일)
+    print(f"  기준 거래일: {trade_date}")
 
     result = {
         "_collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "_trade_date":   report_today, # 리포트 전체 기준일 (무조건 오늘)
-        "_supply_date":  supply_date,  # 수급 데이터 실제 기준일 (별도 관리)
+        "_trade_date":   trade_date,
         "_report_type":  "daily",
         "주가": {
             "종가":   frgn["종가"],   # main_data 수집 후 덮어씀
@@ -672,6 +700,9 @@ def collect_all() -> dict:
     result["주가"]["고가"]   = main_data.get("고가",   0)
     result["주가"]["저가"]   = main_data.get("저가",   0)
     result["주가"]["등락률"] = main_data.get("등락률", 0.0)
+    # 거래량: main 값 우선, 없으면 frgn 값 유지
+    if main_data.get("거래량", 0) > 0:
+        result["주가"]["거래량"] = main_data["거래량"]
 
     # ── Step 3: 시장요약 — 거래대금·시가총액·PER·PBR ──────
     print("  ▶ 시장요약 (거래대금·시총·PER·PBR)...")
@@ -706,7 +737,7 @@ def collect_all() -> dict:
 
     # ── Step 5: 피어 (frgn) ─────────────────────────────
     for name, pt in [("헥토파이낸셜", TICKERS["헥토파이낸셜"]),
-                     ("쿠콘",          TICKERS["쿠콘"])]:
+                     ("쿠콘",         TICKERS["쿠콘"])]:
         print(f"  ▶ {name} (frgn)...")
         p = fetch_peer(pt)
         result["피어"][name] = {
@@ -731,7 +762,6 @@ def collect_all() -> dict:
         csv_news = fetch_news_from_github_csv(
             repo=news_repo,
             keywords=["더즌", "dozn", "헥토파이낸셜", "쿠콘"],
-            target_date=report_today # 리포트 기준일(오늘) 전달
         )
         # 더즌 + dozn 합산, 기타는 Claude 스킬이 판단하도록 전달
         result["뉴스"]["더즌"]        = csv_news.get("더즌", []) + csv_news.get("dozn", [])
@@ -744,7 +774,7 @@ def collect_all() -> dict:
             result["뉴스"][name] = fetch_news(q, max_items=20)
             time.sleep(0.5)
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 수집 완료 — 기준일: {report_today}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 수집 완료 — 기준일: {trade_date}")
     return result
 
 
@@ -753,7 +783,6 @@ def collect_all() -> dict:
 # ─────────────────────────────────────────
 def format_telegram(data: dict) -> str:
     d    = data["_trade_date"]
-    sd   = data["_supply_date"]
     p    = data["주가"]
     s    = data["수급"]
     ma   = data["이동평균"]
@@ -788,7 +817,6 @@ def format_telegram(data: dict) -> str:
         f"  MACD: {ma.get('MACD','-')} / 시그널: {ma.get('MACD_signal','-')} — {ma.get('MACD_cross','')}",
         "",
         "*👥 수급*",
-        f"  기준일: {sd}", # 수급 기준일 명시
         f"  기관: {s.get('기관',0):+,}  외국인: {s.get('외국인',0):+,}  개인: {s.get('개인',0):+,} *(개인 추정)*",
         "",
         "*🏢 기본정보*",
@@ -812,12 +840,10 @@ def format_telegram(data: dict) -> str:
     if not any_disc:
         lines.append("  해당 없음")
 
-    lines += ["", "*📰 오늘 뉴스 (전체 — Claude가 정리)*"]
+    lines += ["", "*📰 오늘 뉴스*"]
     any_news = False
-    # 더즌/헥토파이낸셜/쿠콘/기타 순서로 출력
     news_order = ["더즌", "헥토파이낸셜", "쿠콘", "기타"]
     all_news = data["뉴스"]
-    # 순서 외 키도 포함
     extra_keys = [k for k in all_news if k not in news_order]
     for name in news_order + extra_keys:
         articles = all_news.get(name, [])
@@ -825,12 +851,8 @@ def format_telegram(data: dict) -> str:
         if not real:
             continue
         any_news = True
-        lines.append(f"  ▸ *{name}* ({len(real)}건)")
-        for a in real:
-            press = f"[{a['언론사']}]" if a.get('언론사') else ""
-            t     = f" {a['시간']}"    if a.get('시간') else ""
-            lines.append(f"    {press}{t} {a.get('제목','')}")
-            lines.append(f"    {a.get('링크','')}")
+        # 텔레그램 메시지: 건수만 표시 (제목/링크 특수문자로 인한 파싱 오류 방지)
+        lines.append(f"  ▸ {name}: {len(real)}건 (JSON 파일 참조)")
     if not any_news:
         lines.append("  해당 없음")
 
@@ -851,9 +873,16 @@ def send_telegram(text: str, json_data: dict):
         print(text)
         return
     base = f"https://api.telegram.org/bot{token}"
+    # 제목/링크의 특수문자로 인한 Markdown 파싱 오류 방지
+    # parse_mode 없이 plain text 전송 (가장 안전)
+    plain_text = (text
+        .replace("*", "")
+        .replace("`", "")
+        .replace("_", " "))
+
     r1 = requests.post(f"{base}/sendMessage", json={
-        "chat_id": chat_id, "text": text,
-        "parse_mode": "Markdown", "disable_web_page_preview": True,
+        "chat_id": chat_id, "text": plain_text,
+        "disable_web_page_preview": True,
     })
     if r1.status_code != 200:
         print(f"메시지 전송 실패: {r1.text}")
