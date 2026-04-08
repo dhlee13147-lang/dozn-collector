@@ -1,23 +1,3 @@
-"""
-더즌(462860) 일간 주가 데이터 수집기 v7
-=========================================
-데이터 소스 및 날짜 기준:
-  모든 당일 데이터는 네이버 금융 크롤링 → 항상 현재 날짜 기준
-  기술적 지표(MA/RSI/BB/OBV/MACD)만 pykrx 이력 계산
-
-  frgn 페이지  → 날짜 확정 + OHLCV + 기관/외국인 순매매량
-  시장요약 페이지 → 거래대금 + 시가총액 + PER + PBR
-
-  날짜 결정 로직:
-    frgn 페이지 첫 번째 행의 날짜 = 오늘 기준 최신 거래일
-    (휴장일이면 자동으로 직전 거래일이 첫 번째 행에 표시됨)
-
-환경변수 (GitHub Secrets):
-  TELEGRAM_BOT_TOKEN
-  TELEGRAM_CHAT_ID
-  DART_API_KEY
-"""
-
 import os, json, re, time, urllib.request, urllib.parse
 from datetime import datetime, date, timedelta
 import requests
@@ -167,11 +147,11 @@ def fetch_naver_main(ticker: str) -> dict:
     """네이버 금융 메인 페이지에서 시가/고가/저가/거래대금/등락률 수집
 
     HTML 구조 (첨부 자료 확인):
-      종가:    div.today > p.no_today > em.no_up/no_dn > span.no숫자
+      종가:     div.today > p.no_today > em.no_up/no_dn > span.no숫자
       등락률:  p.no_exday 두 번째 em > span들 (소수점 앞까지)
-      시가:    sp_txt3 다음 em > span.no숫자
-      고가:    sp_txt4 다음 em > span.no숫자
-      저가:    sp_txt5 다음 em > span.no숫자
+      시가:     sp_txt3 다음 em > span.no숫자
+      고가:     sp_txt4 다음 em > span.no숫자
+      저가:     sp_txt5 다음 em > span.no숫자
       거래대금: sp_txt10 다음 em > span.no숫자 (백만원 단위)
 
     pykrx가 아닌 네이버 기준 → frgn 날짜와 일치 보장
@@ -519,6 +499,7 @@ def fetch_news_from_github_csv(
     repo: str,
     csv_path: str = "sent_news.csv",
     keywords: list = None,
+    target_date: str = None, # 인자 추가
 ) -> dict:
     """GitHub 저장소의 sent_news.csv에서 오늘 날짜 기사만 수집
 
@@ -536,7 +517,8 @@ def fetch_news_from_github_csv(
     if keywords is None:
         keywords = ["더즌", "dozn", "헥토파이낸셜", "쿠콘"]
 
-    today_str = date.today().isoformat()  # "YYYY-MM-DD"
+    # target_date가 들어오면 그 날짜를 쓰고, 없으면 오늘 날짜를 씀
+    today_str = target_date if target_date else date.today().isoformat()
     result = {kw: [] for kw in keywords}
     result["기타"] = []   # 키워드 미매칭 기사도 포함 → Claude 스킬이 정리
 
@@ -644,6 +626,9 @@ def collect_all() -> dict:
     t = TICKERS["더즌"]
     dart_key = os.getenv("DART_API_KEY", "")
 
+    # 리포트 전체 기준일은 실행 시점(오늘)으로 확정
+    report_today = date.today().isoformat()
+
     # ── Step 1: frgn에서 날짜·OHLCV·수급 ──────────────
     print("  ▶ frgn (날짜 확정 + OHLCV + 수급)...")
     frgn = fetch_frgn(t)
@@ -651,12 +636,13 @@ def collect_all() -> dict:
         print("  [ERROR] frgn 수집 실패 — 수집 중단")
         return {}
 
-    trade_date = frgn["날짜"]   # 네이버 기준 최신 거래일 (휴장일이면 전 거래일)
-    print(f"  기준 거래일: {trade_date}")
+    supply_date = frgn["날짜"]   # 네이버 기준 최신 거래일 (휴장일이면 전 거래일)
+    print(f"  리포트 기준일: {report_today} | 수급 데이터 기준일: {supply_date}")
 
     result = {
         "_collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "_trade_date":   trade_date,
+        "_trade_date":   report_today, # 리포트 전체 기준일 (무조건 오늘)
+        "_supply_date":  supply_date,  # 수급 데이터 실제 기준일 (별도 관리)
         "_report_type":  "daily",
         "주가": {
             "종가":   frgn["종가"],   # main_data 수집 후 덮어씀
@@ -720,7 +706,7 @@ def collect_all() -> dict:
 
     # ── Step 5: 피어 (frgn) ─────────────────────────────
     for name, pt in [("헥토파이낸셜", TICKERS["헥토파이낸셜"]),
-                     ("쿠콘",         TICKERS["쿠콘"])]:
+                     ("쿠콘",          TICKERS["쿠콘"])]:
         print(f"  ▶ {name} (frgn)...")
         p = fetch_peer(pt)
         result["피어"][name] = {
@@ -745,6 +731,7 @@ def collect_all() -> dict:
         csv_news = fetch_news_from_github_csv(
             repo=news_repo,
             keywords=["더즌", "dozn", "헥토파이낸셜", "쿠콘"],
+            target_date=report_today # 리포트 기준일(오늘) 전달
         )
         # 더즌 + dozn 합산, 기타는 Claude 스킬이 판단하도록 전달
         result["뉴스"]["더즌"]        = csv_news.get("더즌", []) + csv_news.get("dozn", [])
@@ -757,7 +744,7 @@ def collect_all() -> dict:
             result["뉴스"][name] = fetch_news(q, max_items=20)
             time.sleep(0.5)
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 수집 완료 — 기준일: {trade_date}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 수집 완료 — 기준일: {report_today}")
     return result
 
 
@@ -766,6 +753,7 @@ def collect_all() -> dict:
 # ─────────────────────────────────────────
 def format_telegram(data: dict) -> str:
     d    = data["_trade_date"]
+    sd   = data["_supply_date"]
     p    = data["주가"]
     s    = data["수급"]
     ma   = data["이동평균"]
@@ -800,6 +788,7 @@ def format_telegram(data: dict) -> str:
         f"  MACD: {ma.get('MACD','-')} / 시그널: {ma.get('MACD_signal','-')} — {ma.get('MACD_cross','')}",
         "",
         "*👥 수급*",
+        f"  기준일: {sd}", # 수급 기준일 명시
         f"  기관: {s.get('기관',0):+,}  외국인: {s.get('외국인',0):+,}  개인: {s.get('개인',0):+,} *(개인 추정)*",
         "",
         "*🏢 기본정보*",
