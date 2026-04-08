@@ -334,38 +334,37 @@ def fetch_naver_market_sum(ticker: str) -> dict:
 # ─────────────────────────────────────────
 # 3. 네이버 frgn — 피어 그룹 (종가·등락률)
 # ─────────────────────────────────────────
-def fetch_frgn_peer(ticker: str) -> dict:
-    """피어 종목의 종가·등락률만 frgn에서 수집"""
-    url = f"https://finance.naver.com/item/frgn.naver?code={ticker}"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.encoding = "euc-kr"
-        soup = BeautifulSoup(resp.text, "html.parser")
-        table = None
-        for t in soup.find_all("table"):
-            if t.find("td", class_="tc"):
-                table = t
-                break
-        if not table:
-            return {}
-        for row in table.find_all("tr"):
-            tds = row.find_all("td")
-            if len(tds) < 4:
-                continue
-            if not tds[0].find("span", class_="gray03"):
-                continue
-            종가 = to_int(tds[1])
-            # 등락률: tds[3]에서 텍스트 추출
-            등락 = tds[3].get_text(strip=True).replace("%","").replace("+","")
-            try:
-                등락률 = float(등락)
-            except:
-                등락률 = 0.0
-            거래량 = to_int(tds[4])
-            return {"종가": 종가, "등락률": 등락률, "거래량": 거래량}
-    except Exception as e:
-        print(f"    [ERROR] 피어 frgn ({ticker}): {e}")
-    return {}
+def fetch_peer(ticker: str) -> dict:
+    """피어 종목의 종가·등락률·거래량 수집 — fetch_naver_main 동일 방식
+    
+    더즌과 동일 기준 (네이버 main.naver 현재가 기준):
+      종가   : div.today > p.no_today > em
+      등락률 : p.no_exday 두 번째 em
+      거래량 : sp_txt9 다음 em
+    """
+    result = fetch_naver_main(ticker)
+    # 거래량: sp_txt9
+    if not result.get("거래량"):
+        url = f"https://finance.naver.com/item/main.naver?code={ticker}"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            resp.encoding = "euc-kr"
+            soup = BeautifulSoup(resp.text, "html.parser")
+            span = soup.find("span", class_="sp_txt9")
+            if span:
+                td = span.find_parent("td")
+                if td:
+                    em = td.find("em")
+                    val = parse_num_spans(em)
+                    if val > 0:
+                        result["거래량"] = val
+        except:
+            pass
+    return {
+        "종가":   result.get("종가",   0),
+        "등락률": result.get("등락률", 0.0),
+        "거래량": result.get("거래량", 0),
+    }
 
 
 # ─────────────────────────────────────────
@@ -516,6 +515,90 @@ def fetch_dart(corp_code: str, dart_key: str) -> list:
 # ─────────────────────────────────────────
 # 7. 뉴스
 # ─────────────────────────────────────────
+def fetch_news_from_github_csv(
+    repo: str,
+    csv_path: str = "sent_news.csv",
+    keywords: list = None,
+) -> dict:
+    """GitHub 저장소의 sent_news.csv에서 오늘 날짜 기사만 수집
+
+    CSV 형식 (날짜 컬럼 추가된 버전):
+      url, title, date  (3컬럼, date = "YYYY-MM-DD")
+
+    필터 조건:
+      - 날짜 컬럼이 오늘 날짜와 일치하는 행만 포함
+      - 날짜 컬럼 없거나 불일치하는 행은 제외
+      - 언론사 페이지 행 (미디어 URL 또는 제목이 너무 짧은) 제외
+
+    Public 저장소이므로 GITHUB_TOKEN 불필요
+    키워드 미매칭 기사도 "기타" 키로 전달 → Claude 스킬이 판단
+    """
+    if keywords is None:
+        keywords = ["더즌", "dozn", "헥토파이낸셜", "쿠콘"]
+
+    today_str = date.today().isoformat()  # "YYYY-MM-DD"
+    result = {kw: [] for kw in keywords}
+    result["기타"] = []   # 키워드 미매칭 기사도 포함 → Claude 스킬이 정리
+
+    try:
+        raw_url = f"https://raw.githubusercontent.com/{repo}/main/{csv_path}"
+        req = urllib.request.Request(raw_url, headers={"User-Agent": "dozen-collector"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            csv_text = r.read().decode("utf-8-sig", errors="replace")
+
+        import csv as csv_mod, io
+        reader = csv_mod.reader(io.StringIO(csv_text))
+
+        total = 0
+        skipped_date = 0
+        skipped_press = 0
+
+        for row in reader:
+            # 날짜 컬럼 없는 행 제외
+            if len(row) < 3:
+                skipped_date += 1
+                continue
+
+            url_val  = row[0].strip()
+            title    = row[1].strip()
+            row_date = row[2].strip()
+
+            # 날짜 불일치 제외
+            if row_date != today_str:
+                skipped_date += 1
+                continue
+
+            # 언론사 페이지 행 제외 (media.naver.com 또는 도메인만 있는 행)
+            is_press = (
+                "media.naver.com/press" in url_val
+                or (not title or len(title) < 10)
+                or (url_val.count("/") <= 3 and "?" not in url_val)
+            )
+            if is_press:
+                skipped_press += 1
+                continue
+
+            # 키워드 분류
+            matched = False
+            for kw in keywords:
+                if kw in title or kw.lower() in url_val.lower():
+                    result[kw].append({"제목": title, "링크": url_val})
+                    matched = True
+                    total += 1
+                    break
+            if not matched:
+                result["기타"].append({"제목": title, "링크": url_val})
+                total += 1
+
+        kw_counts = {kw: len(v) for kw, v in result.items() if v}
+        print(f"    GitHub CSV ({today_str}): 총 {total}건 | {kw_counts} | 날짜불일치 {skipped_date}건 제외")
+
+    except Exception as e:
+        print(f"    [ERROR] GitHub CSV: {e}")
+
+    return result
+
+
 def fetch_news(query: str, max_items: int = 20) -> list:
     base = "https://search.naver.com/search.naver"
     params = urllib.parse.urlencode({
@@ -639,7 +722,7 @@ def collect_all() -> dict:
     for name, pt in [("헥토파이낸셜", TICKERS["헥토파이낸셜"]),
                      ("쿠콘",         TICKERS["쿠콘"])]:
         print(f"  ▶ {name} (frgn)...")
-        p = fetch_frgn_peer(pt)
+        p = fetch_peer(pt)
         result["피어"][name] = {
             "종가":   p.get("종가", 0),
             "등락률": p.get("등락률", 0.0),
@@ -655,9 +738,24 @@ def collect_all() -> dict:
 
     # ── Step 7: 뉴스 ─────────────────────────────────────
     print("  ▶ 뉴스 수집...")
-    for name, q in [("더즌","더즌 462860"),("헥토파이낸셜","헥토파이낸셜 주가"),("쿠콘","쿠콘 주가")]:
-        result["뉴스"][name] = fetch_news(q, max_items=20)
-        time.sleep(0.5)
+    news_repo = os.getenv("NEWS_REPO", "")  # e.g. "username/news-release"
+    if news_repo:
+        # GitHub CSV 방식 (다른 저장소의 sent_news.csv에서 오늘 기사 추출)
+        print(f"    GitHub CSV 방식: {news_repo}")
+        csv_news = fetch_news_from_github_csv(
+            repo=news_repo,
+            keywords=["더즌", "dozn", "헥토파이낸셜", "쿠콘"],
+        )
+        # 더즌 + dozn 합산, 기타는 Claude 스킬이 판단하도록 전달
+        result["뉴스"]["더즌"]        = csv_news.get("더즌", []) + csv_news.get("dozn", [])
+        result["뉴스"]["헥토파이낸셜"] = csv_news.get("헥토파이낸셜", [])
+        result["뉴스"]["쿠콘"]        = csv_news.get("쿠콘", [])
+        result["뉴스"]["기타"]        = csv_news.get("기타", [])
+    else:
+        # 네이버 뉴스 직접 수집 (fallback)
+        for name, q in [("더즌","더즌 462860"),("헥토파이낸셜","헥토파이낸셜 주가"),("쿠콘","쿠콘 주가")]:
+            result["뉴스"][name] = fetch_news(q, max_items=20)
+            time.sleep(0.5)
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 수집 완료 — 기준일: {trade_date}")
     return result
@@ -727,16 +825,23 @@ def format_telegram(data: dict) -> str:
 
     lines += ["", "*📰 오늘 뉴스 (전체 — Claude가 정리)*"]
     any_news = False
-    for name, articles in data["뉴스"].items():
+    # 더즌/헥토파이낸셜/쿠콘/기타 순서로 출력
+    news_order = ["더즌", "헥토파이낸셜", "쿠콘", "기타"]
+    all_news = data["뉴스"]
+    # 순서 외 키도 포함
+    extra_keys = [k for k in all_news if k not in news_order]
+    for name in news_order + extra_keys:
+        articles = all_news.get(name, [])
         real = [a for a in articles if "_error" not in a]
-        if real:
-            any_news = True
-            lines.append(f"  ▸ *{name}* ({len(real)}건)")
-            for a in real:
-                press = f"[{a['언론사']}]" if a.get('언론사') else ""
-                t     = f" {a['시간']}"    if a.get('시간') else ""
-                lines.append(f"    {press}{t} {a.get('제목','')}")
-                lines.append(f"    {a.get('링크','')}")
+        if not real:
+            continue
+        any_news = True
+        lines.append(f"  ▸ *{name}* ({len(real)}건)")
+        for a in real:
+            press = f"[{a['언론사']}]" if a.get('언론사') else ""
+            t     = f" {a['시간']}"    if a.get('시간') else ""
+            lines.append(f"    {press}{t} {a.get('제목','')}")
+            lines.append(f"    {a.get('링크','')}")
     if not any_news:
         lines.append("  해당 없음")
 
