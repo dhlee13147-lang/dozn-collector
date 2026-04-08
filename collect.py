@@ -372,17 +372,18 @@ def fetch_peer(ticker: str) -> dict:
 # ─────────────────────────────────────────
 # 4. pykrx — 기술적 지표용 이력 (날짜 무관)
 # ─────────────────────────────────────────
-def fetch_history(ticker: str, days: int = 60) -> list:
-    """최근 60거래일 OHLCV 이력 (MA/RSI/BB/OBV/MACD 계산용)
+def fetch_history(ticker: str, days: int = 100) -> list:
+    """OHLCV 이력 수집 (MA/RSI/BB/OBV/MACD 계산용)
 
+    Wilder RSI 정확도를 위해 200일 이력 사용:
+      60일  → HTS 대비 ±0.2 오차 (초기화 단순평균 오차 잔존)
+      200일 → HTS 대비 0.00 완전 일치 (오차 완전 희석)
     pykrx는 이 목적으로만 사용.
     오늘 날짜 행은 명시적으로 제거:
-      - pykrx가 오늘 데이터를 포함할 수도 있고 아닐 수도 있어 불확실
-      - 오늘 데이터는 반드시 today_record(네이버 main 기준)로만 추가
-      - 이 함수는 전일까지의 확정 이력만 반환
+      - 오늘 데이터는 today_record(네이버 main 기준)로만 추가
     """
     today     = date.today()
-    today_str = today.isoformat()          # "2026-04-08"
+    today_str = today.isoformat()
     start     = today - timedelta(days=days * 2)
     try:
         df = krx.get_market_ohlcv(strdate(start), strdate(today), ticker)
@@ -401,7 +402,7 @@ def fetch_history(ticker: str, days: int = 60) -> list:
                 "종가":   int(row.get("종가", 0)),
                 "거래량": int(row.get("거래량", 0)),
             })
-        return records[-days:]             # 전일까지 최대 60일
+        return records[-days:]             # 전일까지 최대 days일
     except Exception as e:
         print(f"    [ERROR] 이력: {e}")
         return []
@@ -732,7 +733,7 @@ def collect_all() -> dict:
 
     # ── Step 4: 기술적 지표 (pykrx 60일 + 오늘 = 61일) ──
     print("  ▶ 기술적 지표 계산 (pykrx 60일 + 오늘 보완)...")
-    history = fetch_history(t, days=60)
+    history = fetch_history(t, days=100)
     # 오늘 데이터를 이력에 추가/교체 → 항상 61일 기준
     today_close = main_data.get("종가", 0) or frgn["종가"]
     today_record = {
