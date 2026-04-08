@@ -9,7 +9,8 @@
   공시               : DART OpenAPI
   뉴스               : 네이버 뉴스
 
-수급(개인/외국인/기관): KRX 엔드포인트 차단으로 미제공 → "-" 표기
+수급(기관/외국인)    : 네이버 금융 frgn 페이지 크롤링 ← 로컬 테스트 확인
+  수급(개인)           : 거래량 - 기관 순매수 - 외국인 순매수 (추정값)
 
 환경변수 (GitHub Secrets):
   TELEGRAM_BOT_TOKEN
@@ -187,7 +188,75 @@ def fetch_naver_market_sum(ticker: str) -> dict:
 
 
 # ─────────────────────────────────────────
-# 3. pykrx — 60일 이력 (기술적 지표용)
+# 3. 네이버 frgn — 기관/외국인 순매매량 (수급)
+# ─────────────────────────────────────────
+def fetch_frgn(ticker: str, trade_day: date) -> dict:
+    """네이버 금융 frgn 페이지에서 기관·외국인 순매매량 수집
+
+    로컬 테스트 확인된 컬럼 매핑:
+      tds[0]: 날짜
+      tds[1]: 종가
+      tds[2]: 전일비  (em 태그 포함으로 span 기반 인덱싱 불가 → td 직접 접근)
+      tds[3]: 등락률
+      tds[4]: 거래량
+      tds[5]: 기관 순매매량
+      tds[6]: 외국인 순매매량
+      tds[7]: 외국인 보유주수
+      tds[8]: 외국인 보유율
+
+    개인 순매매량: 거래량 - 기관 - 외국인 (추정)
+    ※ 순매수 기준이 아닌 거래량 기반 추정치
+    """
+    target_date = trade_day.strftime("%Y.%m.%d")
+    url = f"https://finance.naver.com/item/frgn.naver?code={ticker}"
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.encoding = "euc-kr"
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 날짜 td(class="tc")가 있는 테이블 찾기
+        table = None
+        for t in soup.find_all("table"):
+            if t.find("td", class_="tc"):
+                table = t
+                break
+
+        if not table:
+            print(f"    [WARN] frgn 테이블 미발견")
+            return {}
+
+        for row in table.find_all("tr"):
+            tds = row.find_all("td")
+            if len(tds) < 7:
+                continue
+            date_span = tds[0].find("span", class_="gray03")
+            if not date_span:
+                continue
+            if date_span.text.strip() != target_date:
+                continue
+
+            # td 직접 접근 (span 인덱싱 금지 — 전일비 td에 em 태그 때문에 밀림)
+            def to_int(td):
+                return int(td.get_text(strip=True).replace(",", "").replace("+", "") or 0)
+
+            거래량 = to_int(tds[4])
+            기관   = to_int(tds[5])
+            외국인 = to_int(tds[6])
+            개인   = 거래량 - 기관 - 외국인  # 추정
+
+            print(f"    수급: 기관={기관:+,} 외국인={외국인:+,} 개인={개인:+,} (거래량 기반 추정)")
+            return {"기관": 기관, "외국인": 외국인, "개인": 개인}
+
+        print(f"    [WARN] {target_date} 날짜 행 미발견 (데이터 미확정 가능)")
+    except Exception as e:
+        print(f"    [ERROR] frgn: {e}")
+
+    return {"기관": 0, "외국인": 0, "개인": 0}
+
+
+# ─────────────────────────────────────────
+# 4. pykrx — 60일 이력 (기술적 지표용)
 # ─────────────────────────────────────────
 def fetch_history(ticker: str, days: int = 60) -> list:
     today = date.today()
@@ -386,7 +455,7 @@ def collect_all() -> dict:
         "_collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "_trade_date":   trade_day.strftime("%Y-%m-%d"),
         "_report_type":  "daily",
-        "주가": {}, "수급": {"개인":"-","외국인":"-","기관":"-"},
+        "주가": {}, "수급": {"기관": 0, "외국인": 0, "개인": 0},
         "기본정보": {}, "이동평균": {}, "피어": {}, "공시": {}, "뉴스": {},
     }
 
@@ -411,6 +480,10 @@ def collect_all() -> dict:
         "PER":      market.get("PER", "-"),
         "PBR":      market.get("PBR", "-"),
     }
+
+    # ── 수급 (네이버 frgn) ────────────────────────
+    print("  ▶ 수급 (네이버 frgn)...")
+    result["수급"] = fetch_frgn(t, trade_day)
 
     # ── 기술적 지표 ────────────────────────────────
     print("  ▶ 기술적 지표 계산...")
@@ -486,7 +559,7 @@ def format_telegram(data: dict) -> str:
         f"  MACD: {ma.get('MACD','-')} / 시그널: {ma.get('MACD_signal','-')} — {ma.get('MACD_cross','')}",
         "",
         "*👥 수급*",
-        f"  개인: {s.get('개인','-')}  외국인: {s.get('외국인','-')}  기관: {s.get('기관','-')}",
+        f"  기관: {s.get('기관',0):+,}  외국인: {s.get('외국인',0):+,}  개인: {s.get('개인',0):+,} (추정)",
         "",
         "*🏢 기본정보*",
         f"  시가총액: {cap_str}  PER: {info.get('PER','-')}  PBR: {info.get('PBR','-')}",
