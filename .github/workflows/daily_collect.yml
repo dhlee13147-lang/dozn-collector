@@ -2,9 +2,9 @@ name: 더즌 일간 주가 수집
 
 on:
   schedule:
-    # 매일 07:00 UTC = 16:00 KST
-    - cron: "0 9 * * 1-5"   # 평일(월~금)만 실행
-  workflow_dispatch:          # 수동 실행 버튼
+    # 09:00 UTC = 18:00 KST — 수급/거래대금 확정 이후 수집
+    - cron: "0 9 * * 1-5"
+  workflow_dispatch:
     inputs:
       date_override:
         description: "특정 날짜 지정 (YYYY-MM-DD, 비워두면 오늘)"
@@ -33,6 +33,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           DART_API_KEY:       ${{ secrets.DART_API_KEY }}
+          NEWS_REPO:          ${{ secrets.NEWS_REPO }}
         run: python collect.py
 
       - name: 결과 파일 아티팩트 저장
