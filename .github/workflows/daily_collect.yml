@@ -1,6 +1,10 @@
 name: 더즌 일간 주가 수집
 
 on:
+  repository_dispatch:
+    types: [run_collect] # 구글 스크립트와 이름을 맞춤
+
+on:
   schedule:
     # 09:00 UTC = 18:00 KST — 수급/거래대금 확정 이후 수집
     - cron: "0 9 * * 1-5"
