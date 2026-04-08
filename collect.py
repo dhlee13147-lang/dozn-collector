@@ -728,7 +728,7 @@ def collect_all() -> dict:
         "종가":   today_close,
         "거래량": frgn["거래량"],
     }
-    if history and history[-1]["날짜"] == supply_date:
+    if history and history[-1]["날짜"] == trade_date:
         history[-1] = today_record   # pykrx가 오늘 데이터를 가져왔으면 교체
     else:
         history.append(today_record) # 없으면 추가
