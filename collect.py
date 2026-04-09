@@ -35,14 +35,16 @@ TICKERS = {
     "더즌":        "462860",   # 메인 종목 (반드시 첫 번째)
     "헥토파이낸셜": "234340",   # 피어 그룹 (더즌 외 전부 자동 포함)
     "쿠콘":        "294570",
-    "이노스페이스": "462350",
+    "NHN KCP": "060250",
+    "다날": "064260",
 }
 
 DART_CORP_CODES = {
     "더즌":        "01615947",  # 공시 조회 대상 (1주일치 자동 조회)
     "헥토파이낸셜": "00669540",
     "쿠콘":        "00798833",
-    "이노스페이스": "01700587",
+    "NHN KCP": "00357740",
+    "다날": "00389970",
 }
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -486,7 +488,7 @@ def fetch_dart(corp_code: str, corp_name: str, dart_key: str) -> list:
 # ─────────────────────────────────────────
 def fetch_news_from_github_csv(repo: str, csv_path: str = "sent_news.csv", keywords: list = None) -> dict:
     if keywords is None:
-        keywords = ["더즌", "dozn", "헥토파이낸셜", "쿠콘"]
+        keywords = ["더즌", "dozn", "헥토파이낸셜", "쿠콘", "오픈에셋", "스위치원", "카카오페이"]
 
     today_str = date.today().isoformat()
     result = {kw: [] for kw in keywords}
