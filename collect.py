@@ -682,10 +682,13 @@ def collect_all() -> dict:
     news_repo = os.getenv("NEWS_REPO", "")
     if news_repo:
         print(f"    GitHub CSV: {news_repo}")
-        csv_news = fetch_news_from_github_csv(repo=news_repo, keywords=["더즌","dozn","헥토파이낸셜","쿠콘"])
+        csv_news = fetch_news_from_github_csv(repo=news_repo, keywords=["더즌", "dozn", "헥토파이낸셜", "쿠콘", "오픈에셋", "스위치원", "카카오페이"])
         result["뉴스"]["더즌"]        = csv_news.get("더즌", []) + csv_news.get("dozn", [])
         result["뉴스"]["헥토파이낸셜"] = csv_news.get("헥토파이낸셜", [])
         result["뉴스"]["쿠콘"]        = csv_news.get("쿠콘", [])
+        result["뉴스"]["오픈에셋"]        = csv_news.get("오픈에셋", [])
+        result["뉴스"]["스위치원"]        = csv_news.get("스위치원", [])
+        result["뉴스"]["카카오페이"]        = csv_news.get("카카오페이", [])
         result["뉴스"]["기타"]        = csv_news.get("기타", [])
     else:
         for name, q in [("더즌","더즌 462860"),("헥토파이낸셜","헥토파이낸셜 주가"),("쿠콘","쿠콘 주가")]:
@@ -762,7 +765,7 @@ def format_telegram(data: dict) -> str:
 
     lines += ["", "📰 오늘 뉴스"]
     any_news = False
-    news_order = ["더즌", "헥토파이낸셜", "쿠콘", "기타"]
+    news_order = ["더즌", "헥토파이낸셜", "쿠콘", "오픈에셋", "스위치원", "카카오페이", "기타"]
     all_news = data["뉴스"]
     extra_keys = [k for k in all_news if k not in news_order]
     for name in news_order + extra_keys:
